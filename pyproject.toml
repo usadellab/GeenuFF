@@ -1,0 +1,72 @@
+[build-system]
+# setuptools before 70.1 needs the wheel package to build a wheel
+requires = ["setuptools < 72.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "geenuff"
+version = "0.4.0"
+description = "Schema and API for a relational db that encodes gene models in an explicit, structured, and robust fashion."
+readme = "README.md"
+requires-python = ">=3.10.12"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+]
+dependencies = [
+    "intervaltree>=3.0.2",
+    # 2.0 dropped Engine.execute and raw string execution, both of which are still used here
+    "SQLAlchemy==1.4.54",
+    "numpy>=1.18.1",
+    "pyyaml",
+    # gzip compression and decompression in threads for the scripts' FASTA and GFF3 files
+    "zlib-ng>=1.0.0",
+    "pytest>=5.3.4"
+]
+authors = [
+    {name = "Alisandra K. Denton"},
+    {name = "Felix Holst"},
+    {name= "Janina Mass"},
+    {name = "Felicitas Kindel"},
+]
+
+[project.urls]
+"Homepage" = "https://github.com/usadellab/GeenuFF"
+"Documentation" = "https://usadellab.github.io/GeenuFF/"
+
+[project.license]
+text = "GNU General Public License v3 (GPLv3)"
+
+[tool.setuptools]
+packages = [
+    "geenuff",
+    "geenuff.base",
+    "geenuff.applications",
+    "geenuff.applications.exporters",
+    "geenuff.parsing",
+    "geenuff.tests"
+]
+package-data = {geenuff = ["testdata/*.fa", "testdata/*.gff3", "testdata/*.gff"]}
+script-files = [
+    "import2geenuff.py",
+    "scripts/add_gene_lines.py",
+    "scripts/add_transcript_lines.py",
+    "scripts/check_seqids.py",
+    "scripts/dump_filtered_gff3.py",
+    "scripts/dump_json.py",
+    "scripts/dump_lengthinfo.py",
+    "scripts/dump_to_fasta.py",
+    "scripts/filter_longest_transcripts.py",
+    "scripts/filter_sequence_lengths.py",
+    "scripts/list_transcripts.py",
+    "scripts/rebuild_exons.py",
+    "scripts/rename_gff_seqids.py",
+    "scripts/summarize_geenuff_db.py",
+]
+zip-safe = false
+
+[tool.pytest.ini_options]
+markers = [
+    "helixer: end to end tests running the Helixer h5 export, which needs Helixer installed. Helixer requires GeenuFF rather than the other way round, so deselect these in a general run with -m 'not helixer'",
+]

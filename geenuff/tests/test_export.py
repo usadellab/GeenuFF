@@ -1,20 +1,25 @@
 import os
 import pytest
-from ..applications.importer import ImportController
-from ..applications.exporters.sequence import FastaExportController
-from ..applications.exporters.lengths import LengthExportController
-from ..applications.exporters.json import JsonExportController, FeatureJsonable, TranscriptJsonable, SuperLocusJsonable
-from ..applications.exporter import MODES
+from collections import defaultdict
+from geenuff.applications.importer import ImportController
+from geenuff.applications.exporters.sequence import FastaExportController
+from geenuff.applications.exporters.lengths import LengthExportController
+from geenuff.applications.exporters.json import (JsonExportController, FeatureJsonable,
+                                                 TranscriptJsonable, SuperLocusJsonable)
+from geenuff.applications.exporter import MODES
 from geenuff.base import orm, types
 import json
 from geenuff.applications.exporter import GeenuffExportController
 
-
 EXPORTING_PFX = 'testdata/exporting.'
 EXONEXONCDS_PFX = 'testdata/exonexonCDS.'
+SPLIT_CODON_PFX = 'testdata/split_codon.'
+
+PREFIXES = [EXPORTING_PFX, EXONEXONCDS_PFX, SPLIT_CODON_PFX]
 
 EXPORTING_DB = EXPORTING_PFX + 'sqlite3'
 EXONEXONCDS_DB = EXONEXONCDS_PFX + 'sqlite3'
+SPLIT_CODON_DB = SPLIT_CODON_PFX + 'sqlite3'
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -22,15 +27,15 @@ def prepare_and_cleanup():
     if not os.getcwd().endswith('GeenuFF/geenuff'):
         pytest.exit('Tests need to be run from GeenuFF/geenuff directory')
 
-    for pfx in [EXPORTING_PFX, EXONEXONCDS_PFX]:
+    for pfx in PREFIXES:
         if not os.path.exists(pfx + 'sqlite3'):
             controller = ImportController(database_path='sqlite:///' + pfx + 'sqlite3')
             controller.add_genome(pfx + 'fa', pfx + 'gff3', clean_gff=True,
                                   genome_args={'species': 'dummy'})
 
     yield
-    for db in [EXPORTING_DB, EXONEXONCDS_DB]:
-        os.remove(db)
+    for pfx in PREFIXES:
+        os.remove(pfx + 'sqlite3')
 
 
 def seq_len_controllers(mode, longest=False, db=EXPORTING_DB):
@@ -40,6 +45,45 @@ def seq_len_controllers(mode, longest=False, db=EXPORTING_DB):
     lcontroller = LengthExportController(db_path_in='sqlite:///' + db, longest=longest)
     lcontroller.prep_ranges(range_function=MODES[mode])
     return econtroller, lcontroller
+
+
+def range_positions(arange):
+    """The set of genomic positions a range covers, as positions on the plus strand whichever
+    strand the range is on, so that ranges can be compared to each other as plain sets. On a
+    10 bp sequence, writing a range as start -> end:
+
+        the first three bases read:  plus 0 -> 3 is {0, 1, 2},   minus 9 -> 6 is {7, 8, 9}
+        the whole sequence:          plus 0 -> 10 is {0 ... 9},  minus 9 -> -1 is {0 ... 9}
+    """
+    if arange.is_plus_strand:
+        return set(range(arange.start, arange.end))
+    return set(range(arange.end + 1, arange.start + 1))
+
+
+def positions_by_strand(controller, one_set_per_range):
+    """Collects the positions a controller's prepared export ranges cover into a dict keyed by
+    coordinate and strand, the two being kept apart because a position means a different base on
+    each strand and the modes are computed per strand.
+
+    one_set_per_range keeps each range its own set, so that summed sizes against the size of the
+    union say whether any two of them claim the same base; without it the ranges of one strand
+    are merged, which absorbs the overlap instead. For the two ranges 0 -> 5 and 2 -> 7 on the
+    plus strand of coordinate 1:
+
+        one_set_per_range=True   {(1, True): [{0, 1, 2, 3, 4}, {2, 3, 4, 5, 6}]}
+        one_set_per_range=False  {(1, True): {0, 1, 2, 3, 4, 5, 6}}
+    """
+    out = defaultdict(list) if one_set_per_range else defaultdict(set)
+    for group in controller.export_ranges:
+        # a group is one exported sequence and may be built from several ranges, e.g. the exons
+        # of a spliced transcript, each of which covers its own stretch of the coordinate
+        for arange in group.ranges:
+            key = (arange.coordinate_id, arange.is_plus_strand)
+            if one_set_per_range:
+                out[key].append(range_positions(arange))
+            else:
+                out[key] |= range_positions(arange)
+    return out
 
 
 def compare2controllers(expect, econtroller, lcontroller):
@@ -444,6 +488,29 @@ def test_get_CDS():
     compare2controllers(expect, econtroller, lcontroller)
 
 
+def test_get_CDS_with_a_codon_split_by_an_intron():
+    """A start or stop codon can be cut in two by an intron, in which case it exists only in the
+    spliced CDS. The export joins the pieces across the junction rather than reading the genome
+    contiguously from the CDS boundary, which would read into the intron instead."""
+    econtroller, lcontroller = seq_len_controllers('CDS', db=SPLIT_CODON_DB)
+    assert len(econtroller.export_ranges) == len(lcontroller.export_ranges) == 3
+    spliced = {grp.seqid: ''.join(econtroller.get_seq(grp))
+               for grp in econtroller.export_ranges}
+    # the start codon is split in the first and third, the stop codon in the second, and the
+    # third is on the minus strand, where the C filler reads as G; all 60 bp once spliced
+    assert spliced == {'rnaSplitStart': 'ATGAAA' + 'CCC' * 17 + 'TAA',
+                       'rnaSplitStop': 'ATGAAA' + 'CCC' * 17 + 'TAA',
+                       'rnaSplitStartMinus': 'ATGAAA' + 'GGG' * 17 + 'TAA'}
+
+    # and the introns doing the splitting come back 5' to 3' too, so each reads GT...AG
+    econtroller, lcontroller = seq_len_controllers('introns', db=SPLIT_CODON_DB)
+    assert len(econtroller.export_ranges) == len(lcontroller.export_ranges) == 3
+    for grp, lgrp in zip(econtroller.export_ranges, lcontroller.export_ranges):
+        seq = ''.join(econtroller.get_seq(grp))
+        assert seq.startswith('GT') and seq.endswith('AG')
+        assert lcontroller.get_length(lgrp) == 50
+
+
 def test_get_spliced_UTRs():
     expect = [('Chr1:195000-199000:780-979', 200,
                "AAGCCTTTCTCTTTAAATTCGTTATCGTTTTTTTTATTTTATCAATTTAATCTTTTTATT"
@@ -473,7 +540,7 @@ def test_get_spliced_UTRs():
                "TTTTGTCAACGATCACATTCACATGTCACTTATTAGATATTGTAATATGTAATGTTTGGA"
                "CCGACGTCGAAGCATAAGCAGGTGATTGGTCGATGGATC"
                )
-    ]
+              ]
     econtroller, lcontroller = seq_len_controllers('UTR')
     assert len(econtroller.export_ranges) == len(lcontroller.export_ranges) == 4
     compare2controllers(expect, econtroller, lcontroller)
@@ -493,7 +560,7 @@ def test_get_spliced_UTRs():
                "TGTTTGTTTCGGCAAATAGAAGTTGATGTACATGGCATGTCTGATGTTTGTATTTTGTAC"
                "CTAGAATAATGGAAACAATGCGTT"
                ),
-               ('Gm01:923-1415_Gm01:2042-2081', 533,
+              ('Gm01:923-1415_Gm01:2042-2081', 533,
                "TAACGGCGAAAACTTTGTGTCCACCGCCCAGCCCCTCGGCCAATCCCCCAAAACACAAAA"
                "AACTGTTTTTAAAACATAAAAAAAAAACTCATAACATATGAATAATAATAACAATAAAAA"
                "CTAAGAAGCAATAATTATTATTTAATTGTGCATTAAGATATGATTTAAGGGAGATAAGGG"
@@ -510,11 +577,65 @@ def test_get_spliced_UTRs():
                "TATTTTTCTTTCAAAGGTTGGGGATGATGGGGACAAGATTCAGATATATTATTCAAGATT"
                "AGCTGAAAAGTTTTCTGGGGAGGAGCTCTTTTGTCCTTTTTTTTGTTTTTTTTTCTTCCT"
                "TTTATGTTTAAAATTTCAACCACTATTTTGTTACATTTAAATTGGCATCTTCCCCCATTT"
-               "CCATT")
+               # the sequence's last 56bp are unknown in the test data, written as N
+               "CCATT" + 'N' * 56)
               ]
     econtroller, lcontroller = seq_len_controllers('UTR', db=EXONEXONCDS_DB)
     assert len(econtroller.export_ranges) == len(lcontroller.export_ranges) == 4
     compare2controllers(expect, econtroller, lcontroller)
+
+
+def test_intergenic_ranges_are_what_the_genes_leave_over():
+    """Intergenic ranges are a coordinate minus the transcribed ranges on it, worked out per
+    strand: a strand carrying no gene comes back whole, and the ranges of the minus one run
+    from their higher coordinate down, as everywhere else in GeenuFF."""
+    econtroller, lcontroller = seq_len_controllers('intergenic', db=SPLIT_CODON_DB)
+    assert len(econtroller.export_ranges) == len(lcontroller.export_ranges) == 5
+
+    # two genes at 101-300 and 351-550 on the plus strand of a 900 bp sequence, one at 601-800
+    # on the minus, which leaves the whole of the minus strand above and below that one gene
+    ranges = [(r.is_plus_strand, r.start, r.end)
+              for group in econtroller.export_ranges for r in group.ranges]
+    assert ranges == [(True, 0, 100), (True, 300, 350), (True, 550, 900),
+                      (False, 899, 799), (False, 599, -1)]
+    # named by their GFF3 coordinates and strand
+    assert [group.seqid for group in econtroller.export_ranges] == [
+        'CHR:1-100(+)', 'CHR:301-350(+)', 'CHR:551-900(+)', 'CHR:801-900(-)', 'CHR:1-600(-)']
+
+    lengths = [lcontroller.get_length(group) for group in lcontroller.export_ranges]
+    assert lengths == [100, 50, 350, 100, 600]
+    # both strands of the sequence, less the three genes, each 200 bp long
+    assert sum(lengths) == 2 * 900 - 3 * 200
+
+    # the minus strand ranges are returned 5' to 3', so the filler C of the last 100 bases of
+    # the sequence comes back as G
+    assert ''.join(econtroller.get_seq(econtroller.export_ranges[3])) == 'G' * 100
+
+
+def test_intergenic_ranges_tile_each_strand_with_the_transcribed_ones():
+    """Between them the intergenic and the transcribed ranges account for every base of every
+    strand exactly once, whether the export takes all transcripts or only the longest. The
+    exporting test data has two transcripts one inside the other, so the intergenic ranges of
+    that strand come from subtracting overlapping ranges."""
+    for longest in (False, True):
+        igcontroller, _ = seq_len_controllers('intergenic', longest=longest)
+        txcontroller, _ = seq_len_controllers('pre-mRNA', longest=longest)
+        intergenic = positions_by_strand(igcontroller, one_set_per_range=True)
+        transcribed = positions_by_strand(txcontroller, one_set_per_range=False)
+        coordinates = igcontroller.session.query(orm.Coordinate).all()
+        assert len(coordinates) == 2
+
+        for coord in coordinates:
+            for is_plus_strand in (True, False):
+                pieces = intergenic[(coord.id, is_plus_strand)]
+                covered = set().union(*pieces) if pieces else set()
+                genes = transcribed[(coord.id, is_plus_strand)]
+                # no two intergenic ranges of one strand claim the same base
+                assert sum(len(piece) for piece in pieces) == len(covered)
+                # none of them claims a transcribed base either
+                assert not covered & genes
+                # and nothing between the genes is left out
+                assert covered | genes == set(range(coord.length))
 
 
 def test_get_json_feature():
@@ -534,13 +655,69 @@ def test_get_json_feature():
         slh = SuperLocusJsonable(sl)
         #print(json.dumps(slh.to_jsonable(sl, coord, 790, 3000, True), indent=2))
     #print(controller.session.query(orm.Genome).all())
-    meh = controller.coordinate_range_to_jsonable('dummy', seqid='Chr1:195000-199000', start=1, end=3900, is_plus_strand=True)
+    meh = controller.coordinate_range_to_jsonable('dummy', seqid='Chr1:195000-199000', start=1, end=3900,
+                                                  is_plus_strand=True)
     assert len(meh) == 1
     assert meh[0]['coordinate_piece']['seqid'] == 'Chr1:195000-199000'
     assert len(meh[0]['coordinate_piece']['sequence']) == 3899
     assert len(meh[0]['super_loci']) == 1
     print(json.dumps(meh, indent=2))
     # todo, slightly more thorough testing
+
+
+def json_controller(tmp_path, name):
+    """A JsonExportController over testdata/<name>.fa and .gff3, imported into a fresh database."""
+    db_path = str(tmp_path / f'{name}.sqlite3')
+    ImportController(database_path='sqlite:///' + db_path).add_genome(
+        f'testdata/{name}.fa', f'testdata/{name}.gff3', clean_gff=True, genome_args={'species': 'dummy'})
+    return JsonExportController(db_path)
+
+
+def test_json_minus_strand_genes_are_found_with_an_ascending_range(tmp_path):
+    """The queried range is ascending, [start, end), on either strand. gMinus (GFF 311-410 on the
+    minus strand, i.e. bases 310-409) and gExonEnd (GFF 878-950) are the minus strand genes of
+    testdata/stop_codon.gff3: found on the minus strand over the whole sequence, gMinus over a range
+    containing it and partly contained in a range cutting it, and never on the plus strand."""
+    controller = json_controller(tmp_path, 'stop_codon')
+
+    def genes(start, end, is_plus_strand):
+        out = controller.coordinate_range_to_jsonable('dummy', 'CHR', start, end, is_plus_strand)[0]
+        return out['coordinate_piece'], {sl['given_name']: sl['is_fully_contained'] for sl in out['super_loci']}
+
+    piece, found = genes(0, None, False)
+    assert len(piece['sequence']) == 1300
+    assert found == {'gMinus': True, 'gExonEnd': True}
+    assert 'gMinus' not in genes(0, None, True)[1]
+    piece, found = genes(300, 410, False)
+    assert len(piece['sequence']) == 110
+    assert found == {'gMinus': True}
+    assert genes(350, 500, False)[1] == {'gMinus': False}
+
+
+def test_json_marks_what_becomes_of_each_gene_and_transcript(tmp_path):
+    """See testdata/overlapping_loci_pairs.gff3: geneCrossCoder is kept over geneCrossGivesWay,
+    both lacking UTRs; geneBothTruncatedLeft has a CDS that is not a multiple of 3 and no codons,
+    so it is masked in full. geneCrossCoder (bases 99-398) lies within 0-700 although its masks reach
+    to 725, the masks lying beside it not counting."""
+    controller = json_controller(tmp_path, 'overlapping_loci_pairs')
+    out = controller.coordinate_range_to_jsonable('dummy', 'CHR', 0, 700, True)[0]
+    genes = {sl['given_name']: sl for sl in out['super_loci']}
+
+    kept, dropped = genes['geneCrossCoder'], genes['geneCrossGivesWay']
+    assert (kept['exported'], kept['excluded_from_export'], kept['is_fully_contained']) == (True, None, True)
+    assert (dropped['exported'], dropped['excluded_from_export']) == (False, types.OVERLAP_DROPPED)
+    t_kept, t_dropped = kept['transcripts'][0], dropped['transcripts'][0]
+    assert (t_kept['selected_for_export'], t_kept['exported'], t_kept['error_severity'],
+            t_kept['masked_in_full']) == (True, True, 'flank_masked', False)
+    assert t_kept['masks'] == [[50, 99], [399, 725]]
+    # selected within its gene, but the gene gave way, so nothing of it is exported or masked
+    assert (t_dropped['selected_for_export'], t_dropped['exported'], t_dropped['error_severity'],
+            t_dropped['masks']) == (True, False, 'flank_masked', [])
+
+    out = controller.coordinate_range_to_jsonable('dummy', 'CHR', 1500, 2200, True)[0]
+    truncated = {sl['given_name']: sl for sl in out['super_loci']}['geneBothTruncatedLeft']['transcripts'][0]
+    assert (truncated['exported'], truncated['error_severity'], truncated['masked_in_full']) == (
+        True, 'masked_outright', True)
 
 
 def helper_get_species(pks, session):
@@ -571,7 +748,7 @@ def test_exporter_all_or_1_transcript():
 
 def test_exporter_return_super_loci():
     # this test is here to make sure I don't break something I didn't notice while refactoring
-    # in the long run, I almost certainly want to _change_ the behaviour so genome_query does
+    # in the long run, I almost certainly want to _change_ the behavior so genome_query does
     # not have two different output types.
     controller = GeenuffExportController(db_path_in='sqlite:///' + EXPORTING_DB)
     coords = controller.genome_query(longest_only=False, return_super_loci=True)

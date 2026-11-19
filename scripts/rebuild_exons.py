@@ -1,0 +1,124 @@
+#! /usr/bin/env python3
+"""Rebuilds the exon lines of the transcripts of a GFF3 file whose CDS lines reach outside them, as
+in rare files listing exon lines for the UTRs only. The new exons, the union of a transcript's exon,
+CDS and UTR lines (touching or overlapping lines forming one), replace its exon lines, written after
+its transcript line. Other transcripts are left as they are.
+Only for files where this is systematic: elsewhere, a CDS outside its exons means the CDS or the
+exons are wrong, which GeenuFF masks (cds_outside_exons) and rebuilding would hide.
+See https://github.com/usadellab/GeenuFF/blob/main/docs/scripts.md for more.
+"""
+import argparse
+import logging
+import os
+from collections import defaultdict
+
+from geenuff.applications.importer import CDS_OUTSIDE_EXONS_WARN_SHARE, PIECE_KEYS, TRANSCRIPT_TYPES
+from geenuff.base.helpers import (Compression, add_output_compression_args, add_version_arg, cds_outside_exons,
+                                  check_output_paths, insert_before_extension, merge_gff_spans, open_out,
+                                  output_compression, output_path, require_fasta_and_gff, require_input_files,
+                                  run_main, setup_logging)
+from geenuff.parsing.gffhelper import GFFObject, GFFParser
+
+logger = logging.getLogger(__name__)
+
+OUT_SUFFIX = '_exons_rebuilt'  # inserted before the extension of the GFF3 file's name for the default output
+
+
+def rebuilt_exons(gff_path: str) -> tuple[dict[str, list[tuple[int, int]]], int]:
+    """{transcript ID: its new exon spans} for the transcripts with exon lines whose CDS lines reach
+    outside them, and the number of coding transcripts, with exon lines or not, as GeenuFF's import
+    counts them for its warning."""
+    transcript_ids = set()
+    pieces = defaultdict(lambda: defaultdict(list))  # {transcript ID: {'exons'/'cds'/'utrs': [spans]}}
+    for line in GFFParser.feature_lines(gff_path):
+        columns = line.rstrip('\n').split('\t')
+        feature_type, attributes = columns[2], GFFObject.parse_attributes(columns[8])
+        if feature_type in TRANSCRIPT_TYPES and 'ID' in attributes:
+            transcript_ids.add(attributes['ID'])
+        elif feature_type in PIECE_KEYS:
+            for parent in GFFObject.parents(attributes):
+                pieces[parent][PIECE_KEYS[feature_type]].append((int(columns[3]), int(columns[4])))
+
+    rebuilt, n_coding = {}, 0
+    for transcript_id, spans in pieces.items():
+        if transcript_id not in transcript_ids or not spans['cds']:
+            continue
+        n_coding += 1
+        if spans['exons'] and cds_outside_exons(spans['cds'], spans['exons']):
+            rebuilt[transcript_id] = merge_gff_spans(spans['exons'] + spans['cds'] + spans['utrs'])
+    return rebuilt, n_coding
+
+
+def write_rebuilt(gff_path: str, out_path: str, rebuilt: dict[str, list[tuple[int, int]]],
+                  compression: Compression | None) -> None:
+    """Writes the GFF3 file with the old exon lines of the rebuilt transcripts left out (an exon line
+    shared with other transcripts keeps those as Parent) and their new exon lines after each
+    transcript line."""
+    with open_out(out_path, compression) as f_out:
+        for line in GFFParser.lines(gff_path):
+            columns = line.rstrip('\n').split('\t')
+            if len(columns) < 9 or line.startswith('#'):
+                f_out.write(line)
+                continue
+            attributes = GFFObject.parse_attributes(columns[8])
+            if PIECE_KEYS.get(columns[2]) == 'exons':
+                parents = GFFObject.parents(attributes)
+                kept = [parent for parent in parents if parent not in rebuilt]
+                if parents and not kept:
+                    continue
+                if len(kept) < len(parents):
+                    columns[8] = GFFObject.with_parents(columns[8], kept)
+                    line = '\t'.join(columns) + '\n'
+            f_out.write(line)
+            transcript_id = attributes.get('ID')
+            if columns[2] in TRANSCRIPT_TYPES and transcript_id in rebuilt:
+                seqid, source, strand = columns[0], columns[1], columns[6]
+                for start, end in rebuilt[transcript_id]:
+                    f_out.write(f'{seqid}\t{source}\texon\t{start}\t{end}\t.\t{strand}\t.\tParent={transcript_id}\n')
+
+
+def main(args: argparse.Namespace) -> None:
+    setup_logging(args.log_file)
+    logger.info(f'Rebuilding the exon lines of transcripts with CDS lines outside them in '
+                f'"{os.path.basename(args.gff)}"')
+    rebuilt, n_coding = rebuilt_exons(args.gff)
+    if not rebuilt:
+        logger.info('Every CDS line lies within its exon lines: nothing to rebuild, no file written')
+        return
+    share = len(rebuilt) / n_coding
+    examples = ', '.join(sorted(rebuilt)[:5])
+    logger.info(f'Rebuilt the exons of {len(rebuilt)} of {n_coding} coding transcripts ({share:.1%}), '
+                f'e.g. {examples}')
+    if share <= CDS_OUTSIDE_EXONS_WARN_SHARE:
+        logger.warning(f'Only {share:.1%} of the coding transcripts have CDS lines outside their exons, which '
+                       f'looks like a few wrong genes rather than exon lines for the UTRs only; GeenuFF masks '
+                       f'those on its own, so the original file is likely the better choice')
+        if not args.force:
+            logger.warning('No file written; --force writes it anyway')
+            return
+    write_rebuilt(args.gff, args.out, rebuilt, output_compression(args, args.gff))
+    logger.info(f'Wrote "{args.out}"')
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_version_arg(parser)
+    parser.add_argument('--gff', type=str, required=True, help='GFF3 file (may be gzipped)')
+    parser.add_argument('-o', '--out', type=str,
+                        help=(f'output GFF3 file, gzipped where the input is (see --gzip) (default: the GFF3 file\'s '
+                              f'name with {OUT_SUFFIX} before the extension, e.g. genes{OUT_SUFFIX}.gff3); not '
+                              f'written when nothing is to be rebuilt or, without --force, when '
+                              f'{100 * CDS_OUTSIDE_EXONS_WARN_SHARE:g}%% or fewer of the coding transcripts are'))
+    parser.add_argument('--force', action='store_true',
+                        help=(f'write the output also when {100 * CDS_OUTSIDE_EXONS_WARN_SHARE:g}%% or fewer of the '
+                              f'coding transcripts are to be rebuilt, likely a few wrong genes, which GeenuFF masks on '
+                              f'its own'))
+    add_output_compression_args(parser)
+    parser.add_argument('--log-file', type=str, help='file to write the log to, in addition to the terminal')
+    args = parser.parse_args()
+    require_input_files(parser, [args.gff])
+    require_fasta_and_gff(parser, None, args.gff)
+    default_out = insert_before_extension(args.gff, OUT_SUFFIX)
+    args.out = output_path(args.out or default_out, output_compression(args, args.gff))
+    check_output_paths(parser, [args.out, args.log_file], [args.gff])
+    run_main(main, args)

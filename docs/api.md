@@ -1,32 +1,35 @@
 # Command line tools
-
-__Warning! little about this is stable or tested yet__
-
 ## import a species into the database
 
-You can import a Eukaryotic species genome + annotation into geenuff db (`<YOUR_DATA_NAME>.sqlite3`)
-and log the import to `<YOUR_DATA_NAME>.import.log` as follows:
-
-Capital letters and `<>` indicate what must be user specified.
+Imports a eukaryotic genome and annotation into a GeenuFF database, logging the import; `<>` marks
+what you specify:
 
 ```
-
 import2geenuff.py --fasta <PATH_TO_GENOME_FASTA_FILE> --gff3 <PATH_TO_GFF3_FILE> \
-    --db-path <YOUR_DATA_NAME>.sqlite3 --log-file <YOUR_DATA_NAME>.import.log --species <SPECIES_NAME>
+    --db-path <YOUR_DATA_NAME>.sqlite3 --species <SPECIES_NAME>
 ```
 
-Or with some of the testdata filled in:
+`--db-path` must end in `.sqlite3`. The log is written beside the database as
+`<YOUR_DATA_NAME>_geenuff_import.log`, or to the path given with `--log-file`. The import stops
+before writing anything where an input file does not exist or where `--db-path` or `--log-file`
+names an input file or lies in a directory that does not exist.
+
+For an assembly of more than 30 sequences, the log shows the first 30 sequences added from the
+FASTA file, a progress line per 10 % of the sequences while the features are imported, and then
+the 30 sequences with the most genes. `--verbose` logs every sequence, along with every individual
+error.
+
+Example with some of the testdata filled in:
 ```
 geenuff_path=<PATH/TO/GeenuFF/>
 
-import2geenuff.py --fasta $geenuff_path/geenuff/testdata/exporter.fa \
-    --gff3 $geenuff_path/geenuff/testdata/exporter.gff3 \
-    --db-path dummy.sqlite3 --log-file dummy.import.log --species dummy
+import2geenuff.py --fasta $geenuff_path/geenuff/testdata/exporting.fa \
+    --gff3 $geenuff_path/geenuff/testdata/exporting.gff3 \
+    --db-path dummy.sqlite3 --species dummy
 ```
 
 
-If it is not a problem to pre-arrange your files into the following structure,
-the `--basedir` option can be used to simplify/structure input and output.
+With the files arranged as below, `--basedir` sets input and output in one go:
 
 ```
 # target structure
@@ -36,105 +39,98 @@ the `--basedir` option can be used to simplify/structure input and output.
 # simplified import
 import2geenuff.py --basedir <BASEDIR> --species <SPECIES_NAME>
 
-# the output files "<SPECIES_NAME>.sqlite3" and "import.log" will be written in
-# the directory <BASEDIR>/output/
+# the output files "<SPECIES_NAME>.sqlite3" and "<SPECIES_NAME>_geenuff_import.log" will be
+# written in the directory <BASEDIR>/output/
 ```
 
-Any custom input parameters will overwrite those from `--basedir` if both are
-specified.
-
-You should import one species, into one database, one time. If the output database
-already exists, you can either delete the database
-or set the `--replace-db` parameter.
+`<BASEDIR>/input` must exist and hold one FASTA file (`.fa`, `.fasta`, `.fna` or `.fas`) and one
+GFF3 file (`.gff` or `.gff3`), each possibly gzipped or zipped (`.gz`, `.zip`); `<BASEDIR>/output`
+is created. A GTF file is refused, by its name or its attributes; convert it to GFF3 first, e.g.
+with gffread (`gffread --keep-genes in.gtf -o out.gff3`, without `--keep-genes` no gene lines are
+written) or AGAT (`agat_convert_sp_gxf2gxf.pl`). A damaged or incomplete gzipped or zipped file
+stops the import with an error naming it, and an import stopped by an error leaves no database
+behind. Explicit paths override those from `--basedir`. Import one species into one database once;
+to redo it, delete the database, give it a different name via `--db-path`, or pass `--replace-db`.
 
 ## extract fasta sequences from a database
 
-You can dump transcript, cds, (hopefully soon protein) and a variety
-of other sequence breakdowns from the database back to fasta format using the
-script `GeenuFF/scripts/dump_to_fasta.py`
-
-For instance:
+`dump_to_fasta.py` writes transcripts, CDS and other sequence breakdowns as FASTA (see
+`docs/scripts.md` for all modes):
 
 ```
 # to obtain the CDS (ignoring phase) you can run
-python $geenuff_path/scripts/dump_to_fasta.py --db-path-in <GENUFF_DB> --mode CDS
+dump_to_fasta.py --db-path-in <GENUFF_DB> --mode CDS -o cds.fa
 
 # to obtain the final mRNA sequence you can run
-python $geenuff_path/scripts/dump_to_fasta.py --db-path-in <GENUFF_DB> --mode mRNA
+dump_to_fasta.py --db-path-in <GENUFF_DB> --mode mRNA -o mrna.fa
 
 # to obtain the unspliced transcript you can run
-python $geenuff_path/scripts/dump_to_fasta.py --db-path-in <GENUFF_DB> --mode pre-mRNA
+dump_to_fasta.py --db-path-in <GENUFF_DB> --mode pre-mRNA -o pre_mrna.fa
 ```
 
 ## extract sequence lengths from a database
 
-See above, but use `$geenuff_path/scripts/dump_lengthinfo.py`
-
-Or directly obtain summary statistics by specifying `--stats-only`
+As above with `dump_lengthinfo.py`, or `--stats-only` for summary statistics.
 
 # GeenuFF API
 
-Sometimes one wants to have a little more flexibility than
-already implemented. In such case it may be more useful to use
-the python module.
-
-Warning: nothing about this is stable.
+For more flexibility, use the python module directly. Nothing about it is stable yet,
+the scripts are tested and the intended way to use GeenuFF for most users.
 
 ## import
-If you're looking to change how and where a genome can be imported
-(we do this a lot for e.g. test cases), you can call the python functions more
-directly. E.g. for some of the test data from `$geenuff_path/geenuff`
+To change how and where a genome is imported (as the tests do), call the importer directly, e.g.
+from `$geenuff_path/geenuff`:
 
 ```{python}
 from geenuff.applications.importer import ImportController
 
 controller = ImportController(database_path='sqlite:///' + EXPORTING_DB)
-        controller.add_genome('testdata/exporting.fa', 'testdata/exporting.gff3', clean_gff=True,
-                              genome_args={'species': 'dummy'})
+controller.add_genome('testdata/exporting.fa', 'testdata/exporting.gff3', clean_gff=True,
+                      genome_args={'species': 'dummy'})
 ```
 
-You can also use an in-memory database `'sqlite:///:memory:'`, which
-can be nice for testing or exploring the data / data structure.
-
-At some point we will expand to include a prokaryotic gff importer
-and to make a nice api where a user can make small changes to 
-accommodate their own non-conforming gff (because we really can't
-claim to support them all). But we aren't there yet.
+An in-memory database, `'sqlite:///:memory:'`, is handy for testing or exploring. A prokaryotic
+importer and hooks for non-conforming GFFs are planned, but not there yet.
 
 ## sequence output
-look at `geenuff.applications.exporter` and `geenuff.applications.exporters.sequence`
-
-For instance you might want to use or extend the class `FastaExportController`
-if you wanted to do something with the sequence breakdowns besides writing to a fasta file.
-
-e.g.
+See `geenuff.applications.exporter` and `geenuff.applications.exporters.sequence`, e.g. use or
+extend `FastaExportController` to do something with the sequence breakdowns other than writing
+FASTA:
 
 ```{python}
+from geenuff.applications.exporter import MODES
 from geenuff.applications.exporters.sequence import FastaExportController
 
 controller = FastaExportController(PATH_TO_GEENUFF_DB)
-controller.prep_ranges(mode='pre-mRNA')
+controller.prep_ranges(MODES['pre-mRNA'])
 for export_group in controller.export_ranges:
-    pre_mrna_seq = controller.get_seq(export_group)
+    pre_mrna_seq = ''.join(controller.get_seq(export_group))
     # your code here
     # check for your motif of interest, count kmers, send to custom output, etc...
 ```
 
-If you need to go beyond the currently available sequence breakdowns,
-you can look at `RangeMaker` from `geenuff.applications.exporter`.export_group
+For other breakdowns, see `RangeMaker` in `geenuff.applications.exporter`.
 
 ## gff3 output
-todo
+`FilteredGff3ExportController` in `geenuff.applications.exporters.gff3` writes a plain GFF3 file
+of the longest coding transcript per gene not masked whole, the set the Helixer h5 export gives
+labels from; genes without a coding transcript are skipped (see `scripts.md` for the options):
+
+```
+dump_filtered_gff3.py --db-path-in <GENUFF_DB> -o filtered.gff3
+```
+
+```{python}
+from geenuff.applications.exporters.gff3 import FilteredGff3ExportController
+
+controller = FilteredGff3ExportController(PATH_TO_GEENUFF_DB)
+controller.write_filtered_gff3('filtered.gff3')
+```
 
 ## json output
 
-It's about the most naive implementation possible at the moment
-but geenuff can now query an region and return a somewhat flattened
-json output.
-
-e.g. were PATH_TO_GEENUFF_DB was imported from the test files:
-"geenuff/testdata/exporting.\*" as in the second example for 
-the `import2geenuff.py` section above.
+A simple query of one region, returning flattened JSON, e.g. for a database imported from
+`geenuff/testdata/exporting.*` as above:
 
 ```
 from geenuff.applications.exporters.json import JsonExportController
@@ -145,26 +141,38 @@ json_out = controller.coordinate_range_to_json(species='dummy',
                                                start=1, end=3900, 
                                                is_plus_strand=True)
 ```
-This should return all overlapping super loci and _all_ flattened
- children there of. The returned json should have (hopefully something very 
-similar to, I'm sure there's mistakes) the following format:
+The range is ascending, `[start, end)`, on either strand. It returns every gene on that strand
+whose gene model overlaps the range, whether or not it is exported, with all of its isoforms, or
+with `longest` set on the controller only the transcript selected for export (the one Helixer
+uses), in this format (feature and mask coordinates as stored, start above end on the minus strand):
 
 ```
-[{"coordinate_piece": 
+[{"coordinate_piece":
     {"id": int, "seqid": str, "sequence": str, "start": int, "end": int},
  "super_loci":
-    [{"id": str, 
+    [{"id": int,
       "given_name": str,
+      "type": str,
       "is_fully_contained": bool,
       "overlaps": bool,
-      "transcripts": [{"id": str,
+      "excluded_from_export": str or null (why the gene is left out of exports),
+      "exported": bool (not excluded and with a transcript selected for export),
+      "transcripts": [{"id": int,
                        "given_name": str,
+                       "type": str,
                        "is_fully_contained": bool,
                        "overlaps": bool,
+                       "selected_for_export": bool (the one transcript per gene an export uses),
+                       "exported": bool (selected and its gene not excluded),
+                       "errors": [str, ...] (the error types found, see spec_vs_gff.md), or "not checked"
+                                 for a non-coding transcript or one of a gene whose strand or
+                                 coordinates cannot be placed,
+                       "error_severity": "none", "flank_masked", "masked_outright", or null if not checked,
+                       "masks": [[start, end], ...] (its geenuff_mask features),
+                       "masked_in_full": bool (a mask covering the whole transcript),
                        "features": [{"id": int,
                                      "given_name": str,
-                                     "seqid": str,
-                                     "protein_id", str,
+                                     "protein_id": str,
                                      "type": str,
                                      "start": int,
                                      "start_is_biological_start": bool,
@@ -183,13 +191,9 @@ similar to, I'm sure there's mistakes) the following format:
 }, ...]
 ```
 
-All structure (e.g. many to many relationships) in the database that cannot 
-be captured in the above format will be handled by including the lower in the
-hierarchy elements redundantly. So if you query a super locus which is split
-across two scaffolds, two of the above "coordinate\_pieces" will come back
-and each will have the full set of super\_locus, transcript and feature elements
-except that "is\_fully\_contained" and "overlaps" will be updated for the particular
-coordinate\_piece. Similarly, any transcripts sharing features will simply have
-the features repeated redundantly for each transcript. 
-
-Features in a transcript will always be reported in 5'-3' order.
+"is_fully_contained" and "overlaps" are relative to the queried range: whether the gene model
+lies wholly within it, or touches it at all, the geenuff_mask features beside it not counting.
+With the default range, the whole sequence, every gene is fully contained. "error_severity" grades
+the transcript's own errors as an overlap decision does (see overlap_masking.md), overlaps not
+counting. A gene lies on one sequence, the importer leaving out lines on another sequence than
+their parent, so one query covers it. Features in a transcript are always in 5'-3' order.

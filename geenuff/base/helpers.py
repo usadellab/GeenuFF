@@ -1,13 +1,48 @@
+from __future__ import annotations
+
+import argparse
 import copy
 import hashlib
+import itertools
 import logging
 import enum
+import os
+import sys
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, version
+from types import GeneratorType
+from typing import TYPE_CHECKING, BinaryIO, Protocol, TextIO, TypeVar
 
-##### types related #######
+from zlib_ng import gzip_ng_threaded
+
+from geenuff.parsing.fastahelper import DamagedFile, FastaFormatError, FastaParser, detect_format, text_or_gzip_open
+from geenuff.parsing.gffhelper import GFFObject, GFFParser
+
+if TYPE_CHECKING:
+    from sqlalchemy.engine import Engine
+    from sqlalchemy.orm import Session
+    from sqlalchemy.sql.expression import Insert
+
+    from geenuff.base.orm import Coordinate
+
+logger = logging.getLogger(__name__)
+
+T = TypeVar('T')
+
+
+class StartEnd(Protocol):
+    """Anything with a GeenuFF start and end, e.g. an orm.Feature, a QueriedFeature or a FeatureImporter."""
+    start: int
+    end: int
+
+
+# Types related
+# ----------------------------------
 
 
 # Enum makers
-def join_to_enum(name, *args):
+def join_to_enum(name: str, *args: type[enum.Enum]) -> type[enum.Enum]:
     """joins enums from args into returned enum"""
     enum_bits = []
     for cls in args:
@@ -16,42 +51,32 @@ def join_to_enum(name, *args):
     return out
 
 
-def join_to_enum_strip_redundancy(name, *args):
-    enum_bits = []
-    for cls in args:
-        enum_bits += list(cls)
-    enum_bits = list(set([(x.name, x.value) for x in enum_bits]))
-    out = enum.Enum(name, enum_bits)
-    return out
-
-
-def subtract_enum(name, subtract_from, subtract_this):
-    as_tuples_from = [(x.name, x.value) for x in subtract_from]
-    as_tuples_this = set([(x.name, x.value) for x in subtract_this])
-    enum_bits = [x for x in as_tuples_from if x not in as_tuples_this]
-    out = enum.Enum(name, enum_bits)
-    return out
-
-
-def make_enum(name, *args):
+def make_enum(name: str, *args: str) -> type[enum.Enum]:
     """makes enum from list of strings"""
     return enum.Enum(name, [(x, x) for x in args])
 
 
-##### General #####
-import dustdas.fastahelper
+# General
+# ----------------------------------
+# bases encoded and hashed at a time by sequence_hash; slices up to 64 KiB hashed 500 Mb in 0.30 s,
+# from 256 KiB on in 0.66-0.79 s, as larger slices no longer stay in the CPU cache between encoding
+# and hashing; 64 KiB is the largest of the fast sizes, keeping the loop short (one machine)
+HASH_SLICE = 1 << 16
 
 
-def sequence_hash(sequence):
-    sha1 = hashlib.sha1(sequence.encode())
+def sequence_hash(sequence: str) -> str:
+    """The SHA-1 hex digest of a sequence, hashed in slices so no encoded copy of it all is held."""
+    sha1 = hashlib.sha1()
+    for start in range(0, len(sequence), HASH_SLICE):
+        sha1.update(sequence[start:start + HASH_SLICE].encode())
     return sha1.hexdigest()
 
 
-def in_enum_values(x, enum):
+def in_enum_values(x: object, enum: type[enum.Enum]) -> bool:
     return x in [item.value for item in enum]
 
 
-def none_to_list(x):
+def none_to_list(x: list[T] | None) -> list[T]:
     if x is None:
         return []
     else:
@@ -59,7 +84,7 @@ def none_to_list(x):
         return x
 
 
-def convert2list(obj):
+def convert2list(obj: object) -> list:
     if isinstance(obj, list):
         out = obj
     elif isinstance(obj, set) or isinstance(obj, GeneratorType) or isinstance(obj, tuple):
@@ -69,18 +94,18 @@ def convert2list(obj):
     return out
 
 
-def full_db_path(path):
+def full_db_path(path: str) -> str:
     sqlite_prefix = 'sqlite:///'
     if not path.startswith(sqlite_prefix):
         return sqlite_prefix + path
     return path
 
 
-def db_attr_as_dict(orm_obj):
+def db_attr_as_dict(orm_obj: object) -> dict[str, object]:
     """removes known, shared non-db entry attributes from a copy of orm_obj.__dict__
-    can be used, e.g. to setup new db entry matching the here-by filtered one
+    can be used, e.g. to set up new db entry matching the here-by filtered one
     """
-    exclude = ["_sa_instance_state", "handler"]
+    exclude = ['_sa_instance_state', 'handler']
     out = copy.copy(orm_obj.__dict__)
     for item in exclude:
         if item in out:
@@ -88,124 +113,358 @@ def db_attr_as_dict(orm_obj):
     return out
 
 
-def chunk_str(string, length):
+def chunk_str(string: str, length: int) -> Iterator[str]:
     for i in range(0, len(string), length):
-        yield string[i:(i+length)]
+        yield string[i:(i + length)]
 
 
-def get_repr(class_name, params, addition=''):
-    param_str = ', '.join('{}:{}'.format(k, v) for k, v in params.items())
+def get_repr(class_name: str, params: dict[str, object], addition: str = '') -> str:
+    param_str = ', '.join(f'{k}:{v}' for k, v in params.items())
     if addition:
-        return class_name + '[' +  param_str + ', ' + addition + ']'
+        return class_name + '[' + param_str + ', ' + addition + ']'
     else:
-        return class_name + '[' +  param_str + ']'
+        return class_name + '[' + param_str + ']'
 
 
-##### Mapper #####
+def insert_before_extension(path: str, text: str) -> str:
+    """The path with text inserted before its extension, a final .gz or .zip kept last, e.g.
+    genome.fna.gz and _length_filtered give genome_length_filtered.fna.gz."""
+    compressed = next((suffix for suffix in ('.gz', '.zip') if path.endswith(suffix)), '')
+    stem, extension = os.path.splitext(path[:len(path) - len(compressed)])
+    return f'{stem}{text}{extension}{compressed}'
 
+
+def setup_logging(log_file: str | None = None) -> None:
+    """Logs INFO and above to stdout and, given a path, to that file as well, overwriting it, starting
+    with the GeenuFF version.
+
+    Args:
+        log_file: the file to write the log to besides stdout, if given
+    """
+    handlers = [logging.StreamHandler(sys.stdout)]
+    if log_file:
+        handlers.append(logging.FileHandler(log_file, mode='w'))
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s: %(message)s', handlers=handlers)
+    log_version()
+
+
+# Mapper
+# ----------------------------------
 class NonMatchableIDs(Exception):
-    pass
+    """GFF sequence IDs that are no FASTA ID; missing lists them, sorted."""
 
-class LikelyReveresedIDs(Exception):
-    pass
-
-
-class Mapper(object):
-    def __call__(self, key, *args, **kwargs):
-        return key
+    def __init__(self, message: str, missing: list[str]) -> None:
+        super().__init__(message)
+        self.missing = missing
 
 
-class CheckMapper(Mapper):
-    def __init__(self, keys):
-        self.keys = set(keys)
-
-    def __call__(self, key, *args, **kwargs):
-        if key in self.keys:
-            return key
-        else:
-            raise KeyError("{} not in known keys {}".format(key, self.keys))
+def listed(items: list[str], separator: str = ', ', n_shown: int = 5) -> str:
+    """The first n_shown items for a log line, joined, with '...' where there are more."""
+    return separator.join(items[:n_shown]) + (f'{separator}...' if len(items) > n_shown else '')
 
 
-class DictMapper(Mapper):
-    def __init__(self, key_vals):
-        if not isinstance(key_vals, dict):
-            raise ValueError('key_vals must be a dict instance')
-        self.key_vals = key_vals
+def require_identical_seqids(fasta_ids: Iterable[str], gff_ids: Iterable[str]) -> None:
+    """Checks that every GFF sequence ID is a FASTA sequence ID.
 
-    def __call__(self, key, *args, **kwargs):
-        return self.key_vals[key]
+    Args:
+        fasta_ids: the FASTA sequence IDs, i.e. the headers up to their first whitespace
+        gff_ids: the sequence IDs of the GFF feature lines
 
-
-def make_key_mapper(known_keys, other_keys):
-    to_match_keys = set(known_keys)
-    other_keys = set(other_keys)
-    # if we have a perfect match
-    if to_match_keys == other_keys or to_match_keys.issuperset(other_keys):
-        return CheckMapper(to_match_keys)
-    elif to_match_keys.issubset(other_keys):
-        raise LikelyReveresedIDs('known is a subset of other keys')
-
-    logging.info("attempting to match up, non-identical IDs")
-    oth2known = {}
-    # for each tree key, does it have exactly one match?
-    for key in other_keys:
-        matches = [x for x in to_match_keys if key in x]
-        if len(matches) == 1:
-            # setup dict[old_key] = new_key
-            oth2known[key] = matches[0]
-        elif len(matches) == 0:
-            # pretending no match is ok, (a warning will be logged by are_keys_compatible) but seriously NCBI?
-            logging.debug('no matches found for {} in known keys, e.g. {}'.format(
-                key, list(known_keys)[:min(4, len(known_keys))]
-            ))
-        else:
-            raise NonMatchableIDs('could not identify unique match for {}, but instead got {}'.format(key,
-                                                                                                      matches))
-    if not oth2known:  # bc we can still get an empty dict for complete unrelated gibberish at this point
-        raise NonMatchableIDs('could not uniquely match up known: {} and other: {} keys'.format(known_keys,
-                                                                                                other_keys))
-
-    # check we matched trees to _unique_ fasta keys
-    if len(oth2known.values()) != len(set(oth2known.values())):
-        raise NonMatchableIDs('could not uniquely match up known: {} and other: {} keys'.format(known_keys,
-                                                                                                other_keys))
-    return DictMapper(oth2known)
+    Raises:
+        NonMatchableIDs: if a GFF ID is no FASTA ID.
+    """
+    fasta_ids = set(fasta_ids)
+    missing = sorted(set(gff_ids) - fasta_ids)
+    if missing:
+        raise NonMatchableIDs(f'GFF sequence IDs that are not in the FASTA ({len(missing)}): {listed(missing)} '
+                              f'(FASTA IDs e.g. {listed(sorted(fasta_ids))}); rename_gff_seqids.py pairs '
+                              f'sequences renamed after annotation by their sequence and renames them or removes '
+                              f'GFF IDS (and their genes) not in the FASTA file', missing)
 
 
-def two_way_key_match(known_keys, other_keys):
-    forward = True
+# Script options and file checks
+# ----------------------------------
+# gzip level of the scripts' output files; 4 compresses a genome nearly as well as gzip's default 6,
+# several times faster
+DEFAULT_COMPRESSION_LEVEL = 4
+# threads compressing the scripts' gzipped output files; 489 MB took 6.9 s with 1 thread, 1.9 s with
+# 4, 1.0 s with 8 and 0.5 s with 32 (one test machine), so more threads help nearly in proportion,
+# and 4 is a default that leaves the rest of a shared machine free
+DEFAULT_THREADS = 4
+
+
+def geenuff_version() -> str | None:
+    """The installed GeenuFF version, None where run from a source tree without installing."""
     try:
-        mapper = make_key_mapper(known_keys, other_keys)
-    except LikelyReveresedIDs:
-        mapper = make_key_mapper(other_keys, known_keys)
-        forward = False
-    return mapper, forward
+        return version('geenuff')
+    except PackageNotFoundError:
+        return None
 
 
-def get_seqids_from_gff(gfffile):
-    seqids = set()
-    with dustdas.fastahelper.text_or_gzip_open(gfffile) as f:
-        for line in f:
-            if not line.startswith('#'):
-                seqids.add(line.split('\t')[0])
-    return seqids
+def version_text() -> str:
+    """'GeenuFF <version>', as --version prints it and the scripts log it."""
+    return f'GeenuFF {geenuff_version() or "(not installed, version unknown)"}'
 
 
-##### GFF start/end to GeenuFF #####
-def strand_as_bool(strand):
+def add_version_arg(parser: argparse.ArgumentParser) -> None:
+    """Adds --version, printing the GeenuFF version and exiting."""
+    parser.add_argument('--version', action='version', version=version_text())
+
+
+def log_version() -> None:
+    """Logs the GeenuFF version, the first line of a script's log."""
+    logger.info(version_text())
+
+
+def run_main(main: Callable[[argparse.Namespace], None], args: argparse.Namespace) -> None:
+    """Runs a script's main function; an input file that cannot be read (DamagedFile,
+    FastaFormatError) stops it with exit code 1 and its error logged as one line, without a traceback."""
+    try:
+        main(args)
+    except (DamagedFile, FastaFormatError) as e:
+        logger.error(e)
+        raise SystemExit(1)
+
+
+@dataclass(frozen=True)
+class Compression:
+    """How a gzipped output file is written: its gzip level and the threads compressing it."""
+    level: int
+    threads: int
+
+
+def add_output_compression_args(parser: argparse.ArgumentParser) -> None:
+    """Adds --gzip/--no-gzip, --compression-level and --threads, read by output_compression, to a
+    script's arguments."""
+    parser.add_argument('--gzip', action=argparse.BooleanOptionalAction,
+                        help=('gzip the output files, or write them as plain text; by default each output file is '
+                              'gzipped where its input file is, its name given .gz or not to match'))
+    parser.add_argument('--compression-level', type=int, default=DEFAULT_COMPRESSION_LEVEL, choices=range(1, 10),
+                        metavar='{1-9}', help=(f'gzip level of the output files, 1 fastest, 9 smallest (default: '
+                                               f'{DEFAULT_COMPRESSION_LEVEL})'))
+    parser.add_argument('--threads', type=int, default=DEFAULT_THREADS,
+                        help=(f'threads compressing the gzipped output files; 1 for a single one, -1 for all cores '
+                              f'the system has (default: {DEFAULT_THREADS})'))
+
+
+def compression_for(input_path: str, gzipped: bool | None, compression_level: int,
+                    threads: int = DEFAULT_THREADS) -> Compression | None:
+    """How an output file is gzipped, None for plain text: gzipped as given, else where its input file
+    is gzipped or zipped."""
+    if gzipped is None:
+        gzipped = detect_format(input_path) != 'text'
+    return Compression(compression_level, threads) if gzipped else None
+
+
+def output_compression(args: argparse.Namespace, input_path: str) -> Compression | None:
+    """compression_for with a script's --gzip, --compression-level and --threads (see
+    add_output_compression_args)."""
+    return compression_for(input_path, args.gzip, args.compression_level, args.threads)
+
+
+def output_path(path: str, compression: Compression | None) -> str:
+    """The path ending in .gz for gzipped output, without it for plain text, a final .zip dropped
+    either way."""
+    stem = path.removesuffix('.gz').removesuffix('.zip')
+    return stem if compression is None else f'{stem}.gz'
+
+
+def check_output_paths(parser: argparse.ArgumentParser, outputs: Iterable[str | None],
+                       inputs: Iterable[str | None]) -> None:
+    """Stops with a usage error, before anything is written, where an output's directory does not
+    exist, as for a mistyped path, or where an output names an input file, which writing it would
+    empty before it is read. Paths given as None, i.e. options left out, are skipped."""
+    input_paths = {os.path.realpath(path.removeprefix('sqlite:///')) for path in inputs if path}
+    for path in outputs:
+        if not path:
+            continue
+        directory = os.path.dirname(path.removeprefix('sqlite:///')) or '.'
+        if not os.path.isdir(directory):
+            parser.error(f'the directory "{directory}" of the output "{path}" does not exist')
+        if os.path.realpath(path.removeprefix('sqlite:///')) in input_paths:
+            parser.error(f'the output "{path}" is an input file, which writing it would destroy; give another path')
+
+
+def require_input_files(parser: argparse.ArgumentParser, paths: Iterable[str | None]) -> None:
+    """Stops with a usage error where an input file does not exist, before any output is created (a
+    database opened at a mistyped path would be created empty). Paths given as None are skipped."""
+    for path in paths:
+        if path and not os.path.isfile(path.removeprefix('sqlite:///')):
+            parser.error(f'the input file "{path}" does not exist')
+
+
+# the endings of FASTA, GFF3 and GTF file names, each possibly followed by .gz or .zip
+FASTA_EXTENSIONS = ('.fa', '.fasta', '.fna', '.fas')
+GFF_EXTENSIONS = ('.gff', '.gff3')
+GTF_EXTENSIONS = ('.gtf',)
+# GTF attribute columns start with gene_id or transcript_id, a space and the value
+GTF_ATTRIBUTE_STARTS = (b'gene_id ', b'transcript_id ')
+# gffread writes gene lines only with --keep-genes, its transcripts otherwise naming no Parent gene
+GTF_HINT = ('GeenuFF reads GFF3 only; convert it to GFF3 first, e.g. with gffread (gffread --keep-genes in.gtf '
+            '-o out.gff3) or AGAT (agat_convert_sp_gxf2gxf.pl)')
+
+
+def name_ending(path: str) -> str:
+    """The file name in lowercase without a final .gz or .zip."""
+    return path.lower().removesuffix('.gz').removesuffix('.zip')
+
+
+def is_fasta_name(path: str) -> bool:
+    return name_ending(path).endswith(FASTA_EXTENSIONS)
+
+
+def is_gff_name(path: str) -> bool:
+    return name_ending(path).endswith(GFF_EXTENSIONS)
+
+
+def is_gtf_name(path: str) -> bool:
+    return name_ending(path).endswith(GTF_EXTENSIONS)
+
+
+def require_fasta_and_gff(parser: argparse.ArgumentParser, fasta: str | None, gff: str | None) -> None:
+    """Stops with a usage error where the FASTA or GFF3 file name ends like the other kind's, as when
+    the two are swapped, where the GFF3 file is a GTF file by its name or attributes, where the FASTA
+    file does not start with '>', or where the GFF3 file's first line that is no comment does not
+    have the 9 tab-separated columns of a feature line, e.g. 10 from a sequence ID holding a tab.
+    Either file may be None, for a script reading only the other."""
+    fasta_named_gff = fasta and is_gff_name(fasta)
+    gff_named_fasta = gff and is_fasta_name(gff)
+    if fasta_named_gff and gff_named_fasta:
+        parser.error(f'the FASTA file "{fasta}" and the GFF3 file "{gff}" look swapped by their names')
+    if fasta_named_gff:
+        parser.error(f'"{fasta}", given as the FASTA file, is named like a GFF3 file')
+    if gff_named_fasta:
+        parser.error(f'"{gff}", given as the GFF3 file, is named like a FASTA file')
+    if gff and is_gtf_name(gff):
+        parser.error(f'"{gff}", given as the GFF3 file, is named like a GTF file. {GTF_HINT}')
+    if fasta:
+        with text_or_gzip_open(fasta, 'rb') as f:
+            if f.read(1) != b'>':
+                parser.error(f'"{fasta}" is no FASTA file: it does not start with ">"')
+    if gff:
+        with text_or_gzip_open(gff, 'rb') as f:
+            line = next((line for line in f if line.strip() and not line.startswith(b'#')), b'')
+        columns = line.rstrip(b'\r\n').split(b'\t')
+        if len(columns) != 9:
+            parser.error(f'"{gff}" is no valid GFF3 file: its first feature line has {len(columns)} tab-separated '
+                         f'columns instead of 9: {line.decode(errors="replace").strip()[:200]}')
+        if columns[8].lstrip().startswith(GTF_ATTRIBUTE_STARTS):
+            parser.error(f'"{gff}" is a GTF file by the attributes of its first feature line '
+                         f'({columns[8].decode(errors="replace").strip()[:200]}). {GTF_HINT}')
+
+
+def open_out(path: str, compression: Compression | None, binary: bool = False) -> TextIO | BinaryIO:
+    """Opens a file for writing, gzipped as compression says (with zlib-ng, in threads), or as plain
+    text where it is None."""
+    if compression is None:
+        return open(path, 'wb' if binary else 'w')
+    return gzip_ng_threaded.open(path, 'wb' if binary else 'wt', compresslevel=compression.level,
+                                 threads=compression.threads)
+
+
+def write_fasta_without(fasta_path: str, out_path: str, left_out: set[str], compression: Compression | None) -> None:
+    """Copies a FASTA file byte for byte, leaving out the sequences of the given IDs."""
+    keep = True
+    with open_out(out_path, compression, binary=True) as f_out:
+        for is_header, piece in FastaParser.pieces(fasta_path):
+            if is_header:
+                keep = FastaParser.header_id(piece[1:].decode()) not in left_out
+            if keep:
+                f_out.write(piece)
+
+
+def _ids_on_removed(gff_path: str, removed: set[str]) -> set[str]:
+    """Returns the IDs of the GFF3 lines on the removed sequences, and those whose lines are on kept
+    sequences but their parents all lie on removed ones, i.e. of genes spread over a removed and a
+    kept sequence."""
+    on_removed, on_kept, parents_of = set(), set(), {}
+    for line in GFFParser.feature_lines(gff_path):
+        columns = line.split('\t')
+        attributes = GFFObject.parse_attributes(columns[8])
+        line_id = attributes.get('ID')
+        if line_id is None:
+            continue  # parent line without ID, children can have no ID and still be removed
+        if columns[0] in removed:
+            on_removed.add(line_id)
+        else:
+            on_kept.add(line_id)
+            if parents := GFFObject.parents(attributes):
+                parents_of[line_id] = parents
+    dropped = on_removed - on_kept
+    # one round per level of the Parent chain, e.g. mRNA lines below a gene, then exons below them
+    while below := {line_id for line_id, parents in parents_of.items()
+                    if line_id not in dropped and all(parent in dropped for parent in parents)}:
+        dropped |= below
+    return dropped
+
+
+def write_gff_without(gff_path: str, out_path: str, removed: set[str], compression: Compression | None,
+                      renamed: dict[str, str] | None = None) -> int:
+    """Copies a GFF3 file without the feature and ##sequence-region lines of the removed sequences,
+    and without the lines on kept sequences all of whose parents lie on removed ones, through any
+    number of Parent steps, which the import would leave out as on another sequence than their parent
+    (see _ids_on_removed); a line naming only some of those as Parent keeps the others. The kept
+    sequence IDs in renamed get its new names. Logs and returns the number of lines left out on kept
+    sequences."""
+    renamed = renamed or {}
+    dropped_ids = _ids_on_removed(gff_path, removed)
+    n_below = 0
+    with open_out(out_path, compression) as f_out:
+        for line in GFFParser.lines(gff_path):
+            if line.startswith('##sequence-region'):
+                _, seqid, rest = line.split(maxsplit=2)
+                if seqid in removed:
+                    continue
+                if seqid in renamed:
+                    line = f'##sequence-region {renamed[seqid]} {rest}'
+            elif line.strip() and not line.startswith('#'):
+                columns = line.rstrip('\n').split('\t')
+                if columns[0] in removed:
+                    continue
+                parents = GFFObject.parents(GFFObject.parse_attributes(columns[8]))
+                kept = [parent for parent in parents if parent not in dropped_ids]
+                if parents and not kept:
+                    n_below += 1
+                    continue
+                if len(kept) < len(parents):
+                    columns[8] = GFFObject.with_parents(columns[8], kept)
+                columns[0] = renamed.get(columns[0], columns[0])
+                line = '\t'.join(columns) + '\n'
+            f_out.write(line)
+    if n_below:
+        logger.info(f'Left out {n_below} lines on kept sequences whose parents all lie on removed ones, i.e. of '
+                    f'genes spread over several sequences, which the import leaves out unmasked as well '
+                    f'(i.e. the GeenuFF reason "on another sequence than their parent")')
+    return n_below
+
+
+# GFF start/end to GeenuFF
+# ----------------------------------
+def strand_as_bool(strand: str | None) -> bool:
+    # anything but '+' or '-' raises; use strand_or_none below where that is not fatal
     if strand == '+':
         return True
     elif strand == '-':
         return False
     else:
-        raise ValueError('cannot interpret strand "{}"'.format(strand))
+        raise ValueError(f'cannot interpret strand "{strand}"')
 
 
-def get_strand_direction(gffentry):
+def get_strand_direction(gffentry: GFFObject) -> bool:
     return strand_as_bool(gffentry.strand)
 
 
-def get_geenuff_start_end(gff_start, gff_end, is_plus_strand):
+def strand_or_none(gffentry: GFFObject) -> bool | None:
+    """The entry's strand, or None where the GFF gives neither '+' nor '-', e.g. NCBI's '?' for
+    a trans-spliced feature."""
+    try:
+        return get_strand_direction(gffentry)
+    except ValueError:
+        return None
+
+
+# todo: could this be simpler?
+def get_geenuff_start_end(gff_start: int, gff_end: int, is_plus_strand: bool) -> tuple[int, int]:
     gff_start, gff_end = to_count_from_0(gff_start), to_count_from_0(gff_end)
 
     if is_plus_strand:
@@ -217,22 +476,46 @@ def get_geenuff_start_end(gff_start, gff_end, is_plus_strand):
     return start, end
 
 
-def to_count_from_0(coord):
+def to_count_from_0(coord: int) -> int:
     return coord - 1
 
 
-def to_exclusive_end(end, is_plus_strand):
+def to_exclusive_end(end: int, is_plus_strand: bool) -> int:
     if is_plus_strand:
         return end + 1
     else:
         return end - 1
 
 
-##### Reverse complement #####
+def geenuff_to_gff_start_end(start: int, end: int, is_plus_strand: bool) -> tuple[int, int]:
+    """inverse of get_geenuff_start_end: turns a GeenuFF-internal (0-based, direction-aware,
+    half-open) start/end back into a standard GFF3 1-based, inclusive, ascending start/end"""
+    if is_plus_strand:
+        return start + 1, end
+    else:
+        return end + 2, start + 1
 
-def mk_rc_key():
-    fw = "ACGTMRWSYKVHDBN"
-    rv = "TGCAKYWSRMBDHVN"
+
+def is_masked_whole(transcript_feature: StartEnd, masks: Iterable[StartEnd]) -> bool:
+    """Whether one of the masks covers the whole transcript feature, leaving no labels from it.
+    The masks of a transcript are merged, so one covering it suffices, and any other lies beside
+    it. Takes anything with a GeenuFF start and end, on either strand."""
+    t_lo, t_hi = sorted((transcript_feature.start, transcript_feature.end))
+    return any(min(m.start, m.end) <= t_lo and max(m.start, m.end) >= t_hi for m in masks)
+
+
+# maps "normal" (0, 1, 2; cumulative CDS length so far, mod 3) phase counting to GFF3's
+# biological (0, 2, 1) convention. Self-inverse (0<->0, 1<->2, 2<->1), so the same mapping
+# converts a phase in either direction
+GFF_PHASE_FROM_NORMAL: dict[int, int] = {0: 0, 1: 2, 2: 1}
+
+
+# Reverse complement
+# ----------------------------------
+
+def mk_rc_key() -> dict[str, str]:
+    fw = 'ACGTMRWSYKVHDBN'
+    rv = 'TGCAKYWSRMBDHVN'
     key = {}
     for f, r in zip(fw, rv):
         key[f] = r
@@ -243,68 +526,150 @@ def mk_rc_key():
 REV_COMPLEMENT_KEY = mk_rc_key()
 
 
-def reverse_complement(seq):
+def reverse_complement(seq: Sequence[str]) -> list[str]:
     key = REV_COMPLEMENT_KEY
     rc_seq = []
     for base in reversed(seq):
         try:
             rc_seq.append(key[base])
         except KeyError as e:
-            raise KeyError('{} caused by non DNA character {}'.format(e, base))
+            raise KeyError(f'{e} caused by non DNA character {base}')
     return rc_seq
 
 
-##### Start/Stop codon detection #####
-
+# Start/Stop codon detection
+# ----------------------------------
 START_CODON = 'ATG'
-START_CODON_COMP = ''.join(reverse_complement(START_CODON))
 STOP_CODONS = ['TAG', 'TGA', 'TAA']
-STOP_CODONS_COMP = [''.join(reverse_complement(c)) for c in STOP_CODONS]
 
 
-def substr_seq(seq, start, end, is_plus_strand):
-    """returns a substring of sequence according to geenuff coordinates and strand type"""
+def spliced_cds_sequence(coordinate: 'Coordinate', cds_pieces: Sequence[GFFObject], is_plus_strand: bool) -> str:
+    """joins raw GFF CDS pieces (each with a 1-based, inclusive .start/.end, sorted by
+    ascending genomic start) into one continuous, 5' to 3' oriented sequence"""
+    ordered = cds_pieces if is_plus_strand else reversed(cds_pieces)
+    parts = []
+    for piece in ordered:
+        start, end = get_geenuff_start_end(piece.start, piece.end, is_plus_strand)
+        part = (coordinate.sequence_range(start, end) if is_plus_strand
+                else coordinate.sequence_range(end + 1, start + 1))
+        parts.append(part if is_plus_strand else ''.join(reverse_complement(part)))
+    return ''.join(parts)
+
+
+def has_inframe_stop_codon(cds_seq: str) -> bool:
+    """checks a fully spliced, 5' to 3' oriented CDS sequence for a stop codon before the
+    final codon; a truncated (not a multiple of 3) trailing partial codon is ignored"""
+    last_full_codon_start = len(cds_seq) - len(cds_seq) % 3 - 3
+    codons = (cds_seq[i:i + 3] for i in range(0, last_full_codon_start, 3))
+    return any(codon in STOP_CODONS for codon in codons)
+
+
+def codon_after_cds(cds: Sequence[tuple[int, int]], exons: Sequence[tuple[int, int]],
+                    is_plus_strand: bool) -> tuple[list[int], int]:
+    """The 1-based positions of the 3 bases following a CDS in reading order, along its exons, across
+    an intron if need be, and straight on past the last exon where fewer are left in them, with how
+    many of the 3 lie past the exons; where a stop codon GTF leaves out of the CDS lies. The positions
+    can repeat, for overlapping exons, or lie past the sequence end."""
     if is_plus_strand:
-        return seq[start:end]
+        cds_end = max(end for _, end in cds)
+        in_exons = (p for start, end in sorted(exons) for p in range(max(start, cds_end + 1), end + 1))
+        past = itertools.count(max(end for _, end in [*exons, *cds]) + 1)
     else:
-        return seq[end+1:start+1]
+        cds_start = min(start for start, _ in cds)
+        in_exons = (p for start, end in sorted(exons, reverse=True)
+                    for p in range(min(end, cds_start - 1), start - 1, -1))
+        past = itertools.count(min(start for start, _ in [*exons, *cds]) - 1, -1)
+    following = list(itertools.islice(in_exons, 3))
+    n_past = 3 - len(following)
+    return following + list(itertools.islice(past, n_past)), n_past
 
 
-def has_start_codon(seq, start, is_plus_strand):
-    if is_plus_strand:
-        return substr_seq(seq, start, start + 3, is_plus_strand) == START_CODON
-    else:
-        return substr_seq(seq, start, start - 3, is_plus_strand) == START_CODON_COMP
+# Span/range helpers
+# ----------------------------------
+def merge_ranges(ranges: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Merges ascending, half-open (lo, hi) ranges into a minimal, sorted list of ranges."""
+    merged = []
+    for lo, hi in sorted(ranges):
+        if merged and lo <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+    return [tuple(r) for r in merged]
 
 
-def has_stop_codon(seq, end, is_plus_strand):
-    if is_plus_strand:
-        return substr_seq(seq, end - 3, end, is_plus_strand) in STOP_CODONS
-    else:
-        return substr_seq(seq, end + 3, end, is_plus_strand) in STOP_CODONS_COMP
+def merge_gff_spans(spans: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
+    """GFF spans (1-based, inclusive) sorted and merged where they touch or overlap."""
+    merged = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [(start, end) for start, end in merged]
 
-##### SQL alchemy core queue control #####
 
+def built_exon_spans(pieces: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
+    """The exons of a transcript with CDS lines but no exon lines, built from the GFF spans of its CDS
+    and UTR lines (1-based, inclusive): pieces that touch, such as a UTR ending right before the CDS
+    starts, form one exon. Overlapping pieces stay apart, so that the overlap is found as an error."""
+    exons = []
+    for start, end in sorted(pieces, key=lambda span: span[0]):
+        if exons and start == exons[-1][1] + 1:
+            exons[-1][1] = end
+        else:
+            exons.append([start, end])
+    return [(start, end) for start, end in exons]
+
+
+# CDS position check
+# ----------------------------------
+def cds_outside_exons(cds: Iterable[tuple[int, int]], exons: Iterable[tuple[int, int]]) -> bool:
+    """Whether a CDS span reaches outside the exon spans (GFF, 1-based, inclusive), touching or
+    overlapping exons counting as one."""
+    covered = merge_gff_spans(exons)
+    return any(not any(lo <= start and end <= hi for lo, hi in covered) for start, end in cds)
+
+
+def gff_spans_overlap(spans: Sequence[tuple[int, int]]) -> bool:
+    """Whether any two GFF spans (1-based, inclusive), sorted by start, share a base; any overlap
+    shows between neighbors."""
+    return any(b_start <= a_end for (_, a_end), (b_start, _) in zip(spans, spans[1:]))
+
+
+def outside_sequence(lines: Iterable[GFFObject], length: int) -> list[GFFObject]:
+    """The GFF lines starting before position 1 or ending past a sequence of the given length."""
+    return [line for line in lines if line.start < 1 or line.end > length]
+
+
+# String/import summary formatting
+# ----------------------------------
+def plural(n: int, noun: str) -> str:
+    """'1 transcript', '2 transcripts'."""
+    return f'{n} {noun}{"" if n == 1 else "s"}'
+
+
+# SQL alchemy core queue control
+# ----------------------------------
 class Counter(object):
-    def __init__(self, cl=None, at=0):
+    def __init__(self, cl: type | None = None, at: int = 0) -> None:
         self.cl = cl
         self._at = at
 
-    def __call__(self, *args, **kwargs):
+    def __call__(self, *args: object, **kwargs: object) -> int:
         self._at += 1
         return self._at
 
 
 class QueueController(object):
-    def __init__(self, session, engine):
+    def __init__(self, session: Session, engine: Engine) -> None:
         self.session = session
         self.engine = engine
-        self.ordered_queues = []
+        self.ordered_queues: list[CoreQueue] = []
 
-    def total_size(self):
+    def total_size(self) -> int:
         return sum([len(q.queue) for q in self.ordered_queues])
 
-    def execute_so_far(self):
+    def execute_so_far(self) -> None:
         conn = self.engine.connect()
         n_elements = self.total_size()
         for queue in self.ordered_queues:
@@ -312,10 +677,10 @@ class QueueController(object):
                 conn.execute(queue.action, queue.queue)
                 del queue.queue[:]
         self.session.commit()
-        logging.info(f'All core queues executed ({n_elements} elements)')
+        logger.debug(f'All core queues executed ({n_elements} elements)')
 
 
 class CoreQueue(object):
-    def __init__(self, action):
-        self.queue = []
+    def __init__(self, action: Insert) -> None:
+        self.queue: list[dict[str, object]] = []
         self.action = action

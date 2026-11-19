@@ -1,14 +1,12 @@
-from .helpers import (join_to_enum,
-                      make_enum,
-                      join_to_enum_strip_redundancy,
-                      subtract_enum)
+from geenuff.base.helpers import join_to_enum, make_enum
 
 
-from .so import (SOSequenceFeatures,
-                 SOSuperLocusFeatures,
-                 SOTranscriptFeatures,
-                 SOCDSFeatures,
-                 SOExonFeatures)
+from geenuff.base.so import (SO_SEQUENCE_TERMS,
+                             SOSuperLocusFeatures,
+                             SOTranscriptFeatures,
+                             SOCDSFeatures,
+                             SOExonFeatures,
+                             SOUTRFeatures)
 ########
 # GFF
 ########
@@ -17,34 +15,41 @@ from .so import (SOSequenceFeatures,
 SuperLocusAll = join_to_enum('SuperLocusAll', SOSuperLocusFeatures)
 
 # Transcript
-TranscriptLevel = join_to_enum('TranscriptLevel', SOTranscriptFeatures)
+# NCBI's spelling of SO's lncRNA, in many NCBI plant annotations; unknown, its lines would be left
+# out and its exon lines counted as naming no parent
+LNC_RNA_NCBI = 'lnc_RNA'
+TranscriptLevel = join_to_enum('TranscriptLevel', SOTranscriptFeatures,
+                               make_enum('NonSOTranscriptFeatures', LNC_RNA_NCBI))
 
 # ignorable (and non-SO sequence features) from Augustus
 TRANSCRIPTION_START_SITE = 'transcription_start_site'  # transcription_start_site
 TRANSCRIPTION_START_SITE2 = 'tss'  # transcription_start_site (older Augustus version)
 TRANSCRIPTION_TERMINATION_SITE2 = 'tts'  # transcription_termination_site
-FIVE_PRIME_UTR_LOWER = 'five_prime_utr'
-THREE_PRIME_UTR_LOWER = 'three_prime_utr'
 
-IgnorableGFFFeatures = make_enum('IgnorableGFFFeatures', TRANSCRIPTION_START_SITE,
-                                 TRANSCRIPTION_START_SITE2,
-                                 TRANSCRIPTION_TERMINATION_SITE2, FIVE_PRIME_UTR_LOWER,
-                                 THREE_PRIME_UTR_LOWER)
 
 # other useful features
 ExonLevel = join_to_enum('ExonLevel', SOExonFeatures)
 CDSLevel = join_to_enum('CDSLevel', SOCDSFeatures)
+# Augustus' lowercase UTR types; a transcript without exon lines gets its exons built from its CDS
+# and UTR lines, so without them its UTRs would be lost and the gene masked whole
+FIVE_PRIME_UTR_LOWER = 'five_prime_utr'
+THREE_PRIME_UTR_LOWER = 'three_prime_utr'
+UTRLevel = join_to_enum('UTRLevel', SOUTRFeatures,
+                        make_enum('NonSOUTRFeatures', FIVE_PRIME_UTR_LOWER, THREE_PRIME_UTR_LOWER))
 
-UsefulGFFFeatures = join_to_enum('UsefulGFFFeatures', SuperLocusAll, TranscriptLevel,
-                                 ExonLevel, CDSLevel)
-
-
-# we will need a list that can be ignored, so w/o things like exon and CDS, but that we can nevertheless
-# use to check for typos/blatantly invalid gff3
-OnlySoFeatures = subtract_enum('OnlySoFeatures', subtract_from=SOSequenceFeatures, subtract_this=UsefulGFFFeatures)
-IgnorableGFFFeatures = join_to_enum('IgnorableGffFeatures', IgnorableGFFFeatures, OnlySoFeatures)
-
-AllKnownGFFFeatures = join_to_enum('AllKnownGFFFeatures', IgnorableGFFFeatures, UsefulGFFFeatures)
+# GFF3 types, as sets for looking up each line's type: those GeenuFF imports, those it skips
+# silently (every other SO term and the Augustus types above), and all it knows; a type it does not
+# know is counted as unrecognized
+USEFUL_GFF_TYPES = frozenset(x.value for level in (SuperLocusAll, TranscriptLevel, ExonLevel, CDSLevel, UTRLevel)
+                             for x in level)
+IGNORABLE_GFF_TYPES = ((SO_SEQUENCE_TERMS - USEFUL_GFF_TYPES)
+                       | {TRANSCRIPTION_START_SITE, TRANSCRIPTION_START_SITE2, TRANSCRIPTION_TERMINATION_SITE2})
+KNOWN_GFF_TYPES = IGNORABLE_GFF_TYPES | USEFUL_GFF_TYPES
+# the GFF3 types of each kind, and where an exon, CDS or UTR line goes among its transcript's lines
+GENE_TYPES = frozenset(x.value for x in SuperLocusAll)
+TRANSCRIPT_TYPES = frozenset(x.value for x in TranscriptLevel)
+PIECE_KEYS = {x.value: key for level, key in [(ExonLevel, 'exons'), (CDSLevel, 'cds'), (UTRLevel, 'utrs')]
+              for x in level}
 
 ###########
 # GeenuFF #
@@ -53,27 +58,47 @@ AllKnownGFFFeatures = join_to_enum('AllKnownGFFFeatures', IgnorableGFFFeatures, 
 GEENUFF_TRANSCRIPT = 'geenuff_transcript'
 GEENUFF_CDS = 'geenuff_cds'
 GEENUFF_INTRON = 'geenuff_intron'
+# a range not to be trained on, all errors of its transcript merged into it (see orm.TranscriptError
+# for which errors those are)
+GEENUFF_MASK = 'geenuff_mask'
 GeenuffSequenceFeature = make_enum('GeenuffSequenceFeature', GEENUFF_TRANSCRIPT, GEENUFF_CDS,
-                                   GEENUFF_INTRON)
+                                   GEENUFF_INTRON, GEENUFF_MASK)
 
-# Geenuff error types
+# Geenuff error types, recorded per transcript in orm.TranscriptError without a range of their own
 MISSING_UTR_5P = 'missing_utr_5p'
 MISSING_UTR_3P = 'missing_utr_3p'
-EMPTY_SUPER_LOCUS = 'empty_super_locus'
 MISSING_START_CODON = 'missing_start_codon'
 MISSING_STOP_CODON = 'missing_stop_codon'
 WRONG_PHASE_5P = 'wrong_starting_phase'
-MISMATCHED_PHASE_3P = 'mismatched_ending_phase'
 OVERLAPPING_EXONS = 'overlapping_exons'
+OVERLAPPING_CDS = 'overlapping_cds'
+CDS_OUTSIDE_EXONS = 'cds_outside_exons'
 TOO_SHORT_INTRON = 'too_short_intron'
+TOO_SHORT_CDS = 'too_short_cds'
 SL_OVERLAP_ERROR = 'super_loci_overlap_error'
-MISMATCHING_STRANDS = 'missmatching_strands'
 TRUNCATED_INTRON = 'truncated_intron'
-Errors = make_enum('Errors', MISSING_UTR_5P, MISSING_UTR_3P, EMPTY_SUPER_LOCUS, MISSING_START_CODON,
-                   MISSING_STOP_CODON, WRONG_PHASE_5P, MISMATCHED_PHASE_3P, OVERLAPPING_EXONS,
-                   TOO_SHORT_INTRON, SL_OVERLAP_ERROR, MISMATCHING_STRANDS, TRUNCATED_INTRON)
+TRUNCATED_CDS = 'truncated_cds'
+INFRAME_STOP_CODON = 'inframe_stop_codon'
+FLOATING_CDS = 'floating_cds'  # CDS lines without a transcript line
+BEYOND_SEQUENCE_EDGE = 'beyond_sequence_edge'  # a coding transcript reaching past its sequence
+Errors = make_enum('Errors', MISSING_UTR_5P, MISSING_UTR_3P, MISSING_START_CODON, MISSING_STOP_CODON,
+                   WRONG_PHASE_5P, OVERLAPPING_EXONS, OVERLAPPING_CDS, TOO_SHORT_INTRON, SL_OVERLAP_ERROR,
+                   TRUNCATED_INTRON, TRUNCATED_CDS, INFRAME_STOP_CODON, FLOATING_CDS, BEYOND_SEQUENCE_EDGE,
+                   TOO_SHORT_CDS, CDS_OUTSIDE_EXONS)
 
-# frequently used for lookups
-geenuff_error_type_values = [t.value for t in Errors]
+# Reasons a super locus is left out of exports (orm.SuperLocus.excluded_from_export). Kept apart
+# from the error types above and deliberately not in the Errors enum: an error marks a range as
+# unreliable, while these say there is no honest way to export the locus at all. Its features
+# stay in the database either way.
+UNPLACEABLE_STRAND = 'unplaceable_strand'  # not on one definite strand, see docs/trans_splicing.md
+UNPLACEABLE_COORDINATES = 'unplaceable_coordinates'  # a line whose start runs past its end
+OUTSIDE_SEQUENCE = 'outside_sequence'  # a line past its sequence, no CDS line lying on it
+OVERLAP_DROPPED = 'overlap_dropped'  # gave way so an overlapping partner could be kept whole
 
-GeenuffFeature = join_to_enum('GeenuffFeature', GeenuffSequenceFeature, Errors)
+# of those, the reasons a locus cannot be written out at all, whatever it is written for: where
+# its features belong is what is unknown about it. OVERLAP_DROPPED is deliberately not among
+# them, nothing being wrong with such a locus beyond sharing sequence with another, which only a
+# consumer holding one label per base pair cannot take.
+unrepresentable_reasons = (UNPLACEABLE_STRAND, UNPLACEABLE_COORDINATES, OUTSIDE_SEQUENCE)
+
+GeenuffFeature = join_to_enum('GeenuffFeature', GeenuffSequenceFeature)

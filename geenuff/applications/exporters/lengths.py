@@ -1,11 +1,15 @@
+import logging
+
 import numpy
 
 from geenuff.applications.exporter import GeenuffExportController
 
+logger = logging.getLogger(__name__)
+
 
 class LengthExportController(GeenuffExportController):
-    def __init__(self, db_path_in, longest=False):
-        super().__init__(db_path_in, longest)
+    def __init__(self, db_path_in, longest=False, coding=False):
+        super().__init__(db_path_in, longest, coding)
         self.export_ranges = []
 
     @staticmethod
@@ -19,28 +23,34 @@ class LengthExportController(GeenuffExportController):
         handle_out = self._as_file_handle(file_out)
         for export_group in self.export_ranges:
             l = self.get_length(export_group)
-            handle_out.write("{}\t{}\n".format(export_group.seqid, l))
-        handle_out.close()
+            handle_out.write(f'{export_group.seqid}\t{l}\n')
+        if file_out is not None:
+            handle_out.close()
+        logger.info(f'Wrote the lengths of {len(self.export_ranges)} export ranges')
 
     def write_length_stats(self, file_out):
         lengths = []
         for export_group in self.export_ranges:
             lengths.append(self.get_length(export_group))
 
-        stats = basics(lengths)
-        quants = fmt_keys(quantiles(lengths), pfx="quantile_")
-        nxes = fmt_keys(nx(lengths), pfx="N", sfx="")
+        if lengths:
+            groups = [basics(lengths), fmt_keys(quantiles(lengths), pfx='quantile_'),
+                      fmt_keys(nx(lengths), pfx='N', sfx='')]
+        else:
+            groups = [{'count': 0}]
 
         handle_out = self._as_file_handle(file_out)
-        for group in [stats, quants, nxes]:
+        for group in groups:
             handle_out.write(fmt_stats(group))
-        handle_out.close()
+        if file_out is not None:
+            handle_out.close()
+        logger.info(f'Wrote length statistics over {len(lengths)} export ranges')
 
 
 def fmt_stats(a_dict):
-    out = ""
+    out = ''
     for key in sorted(a_dict.keys()):
-        out += "{}\t{}\n".format(key, a_dict[key])
+        out += f'{key}\t{a_dict[key]}\n'
     return out
 
 
@@ -84,10 +94,10 @@ def quantiles(lengths, x_vals=None):
     return out
 
 
-def fmt_keys(a_dict, pfx, sfx="%", times_by=100):
-    """convert fraction keys to labelled percentages (or similar)"""
+def fmt_keys(a_dict, pfx, sfx='%', times_by=100):
+    """convert fraction keys to labeled percentages (or similar)"""
     out = {}
     for key in a_dict:
-        new_key = "{}{}{}".format(pfx, int(key * times_by), sfx)
+        new_key = f'{pfx}{int(key * times_by)}{sfx}'
         out[new_key] = a_dict[key]
     return out

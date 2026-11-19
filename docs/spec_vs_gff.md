@@ -2,40 +2,106 @@
 ### features
 
 #### types
-Feature types differ somewhat from a gff, "geenuff_" has been 
-appended to names to reduce confusion where the meaning is not
-identical.
+Feature types differ from a GFF's; the "geenuff_" prefix marks where the meaning is not identical.
 
 ##### core types:
 * geenuff_transcript: range of pre-mRNA / unspliced transcript
 * geenuff_cds: range between the start and stop codon (ignoring introns)
-* geenuff_intron / trans intron: range between a donor and acceptor splice site
+* geenuff_intron: range between a donor and acceptor splice site
+* geenuff_mask: range not to be trained on, everything the errors of its transcript mask merged
+  into as few ranges as possible
 
 ##### error types:
-These do not exist in a gff, but are used in geenuff to denote things
-that might be ambiguous or unknown about a gene model. 
+Errors mark what is ambiguous or unknown about a gene model; only coding transcripts are checked.
+Each error type found is recorded once per transcript in the `transcript_error` table;
+what the errors mask in sum is worked out once per transcript and stored as its geenuff_mask
+features (see the table below).
 
-Currently errors are assigned when any obvious gene model inconsistency
-is encountered during gff parsing. Most error types
-are extended from the end of a known feature half way to the next
-gene model, while some internal errors (e.g. too_short_intron) can
-be assigned more precisesly. If gff format were not used as an intermediary
-and gene annotation was performed and stored directly in a geenuff structured
-database, all the errors could be assigned more precise ranges for any
-ambiguity.
+An error leaving a gene's end unknown is extended into the unclaimed sequence beside the gene, the
+*flank*, reaching `min(gap // 2, int(sqrt(gap)) * 10)` bp into the gap toward the closest edge of
+another exported coding gene on that side and strand, or toward the end of the sequence. A gene
+dropped for an overlap counts as a neighbor, one overlapping the gene does not. Genes without a
+CDS never bound a flank, so that a transposon or lncRNA overlapping a coding gene cannot leave it
+without one. Like every mask, the flank covers only the gene's own strand.
 
-Types are:
+**To watch: masking in dense genomes.** Up to a gap of about 400 bp the flanks of two genes nearly
+meet: an erroneous gene masks half of every gap next to it, and a gap between two erroneous genes
+is masked entirely, save one base. Beyond it the middle of the gap stays usable as intergenic:
 
-* missing_utr_5p
-* missing_utr_3p
-* empty_super_locus
-* missing_start_codon
-* missing_stop_codon
-* wrong_starting_phase 
-* mismatched_ending_phase
-* overlapping_exons
-* too_short_intron
-* super_loci_overlap_error
+| gap    | flank per erroneous side | gap masked, one erroneous neighbor  | gap masked, both erroneous |
+|--------|--------------------------|-------------------------------------|----------------------------|
+| 100 bp | 50 bp                    | 50 %                                | 100 %                      |
+| 400 bp | 200 bp                   | 50 %                                | 100 %                      |
+| 1 kb   | 310 bp                   | 31 %                                | 62 %                       |
+| 2.5 kb | 500 bp                   | 20 %                                | 40 %                       |
+| 10 kb  | 1000 bp                  | 10 %                                | 20 %                       |
+
+Within one gap this rarely masks clearly intergenic sequence, 50-200 bp being a typical UTR length.
+The risk is a bias: in compact genomes (fungi, many algae, gene-dense plant regions) short
+intergenic stretches are underrepresented in training, unmasked intergenic sequence coming mostly
+from long gaps or gaps beside clean genes. To check on a dense and a sparse genome: the share of
+intergenic bp masked by gap size; a possible remedy is a share below half the gap.
+
+| type                     | cause                                                | masked                                  |
+|--------------------------|------------------------------------------------------|-----------------------------------------|
+| missing_utr_5p           | CDS starts where the transcript starts               | 5' flank, up to the CDS start           |
+| missing_utr_3p           | CDS ends where the transcript ends                   | 3' flank, from the CDS end              |
+| missing_start_codon      | spliced CDS does not begin with ATG                  | whole gene and both flanks              |
+| missing_stop_codon       | spliced CDS does not end with a stop codon           | whole gene and both flanks              |
+| truncated_cds            | spliced CDS length is not a multiple of 3            | whole gene and both flanks              |
+| inframe_stop_codon       | a stop codon in frame before the end of the CDS      | whole gene and both flanks              |
+| too_short_cds            | spliced CDS shorter than `min_cds_length` (60 bp)    | whole gene and both flanks              |
+| truncated_intron         | the transcript line reaches past its outermost exon  | whole gene and both flanks              |
+| too_short_intron         | full intron shorter than `min_intron_length` (20 bp) | whole gene and both flanks              |
+| overlapping_exons        | two exon lines of one transcript overlap             | whole gene and both flanks              |
+| overlapping_cds          | two CDS lines of one transcript overlap              | whole gene and both flanks              |
+| cds_outside_exons        | a CDS line reaches outside the exon lines            | whole gene and both flanks              |
+| floating_cds             | CDS lines without a transcript line (see grouping)   | whole gene and both flanks              |
+| beyond_sequence_edge     | coding transcript reaching past its sequence         | whole gene, as clipped, and both flanks |
+| wrong_starting_phase     | phase of the first CDS piece in the file is not 0    | nothing, only recorded                  |
+| super_loci_overlap_error | two coding genes share sequence                      | see below and `overlap_masking.md`      |
+
+A missing UTR leaves only the transcript's end unknown; the CDS stays labeled. Every other error
+that masks means the CDS boundaries are not trusted, so the gene is masked whole with both
+flanks: masking only part would leave a hole whose edges read as transitions that are not there
+(see `overlap_masking.md`). Notes on single error types:
+- too_short_intron: typically stands in for an assembly frameshift an annotation pipeline bridged.
+- truncated_intron: the transcript starts or ends with an intron, its length not checked; the
+  transcript's start or end counts as not biological.
+- too_short_cds: a CDS below 60 bp, the stop codon included and counted after one left out of the
+  CDS is added, is more likely a fragment or an artifact than a gene; Helixer also drops predicted
+  genes with less coding sequence by default (HelixerPost's `--min-coding-length` of 60). Masked
+  rather than left out, a real micropeptide gene is not taught as intergenic either.
+- overlapping_exons, overlapping_cds: such lines cannot exist, so both ends of the transcript and
+  CDS count as not biological and nothing else is checked, the spliced CDS repeating the shared
+  bases. The same holds for cds_outside_exons, the CDS lying in an intron according to GFF3 file
+  conventions. Duplicate CDS lines in an input GFF3 file can make GeenuFF flag the affected genes
+  as erroneous (mostly as `overlapping_cds`) and mask them in full, so remove exact duplicates
+  before the import (e.g. `awk '/^#/ || !seen[$0]++' in.gff3 > out.gff3`).
+- wrong_starting_phase: changes no label, the importer setting every phase itself, so it masks
+  nothing; the phases of later CDS pieces are not checked, a CDS leaving its frame being caught as
+  truncated_cds.
+
+Both minimums, `min_cds_length` and `min_intron_length`, can be changed with a config file given
+to `import2geenuff.py --config-file` (see `config/import.yml`). Above 5% of the coding transcripts
+with overlapping exons or a CDS outside the exons, the import warns and lists files from GeenuFF
+that might help.
+
+###### super_loci_overlap_error is positioned differently:
+It marks sequence two exported coding genes both claim, every shared base carrying two
+incompatible labels, rather than anything wrong with one gene, and is recorded for the exported
+transcript only. Of two crossing genes the better one is kept whole and masked over what its
+dropped partner covered beyond it, without a flank of its own; a nested or refused pair is masked
+whole with both flanks. See `overlap_masking.md` for the rules and the `super_locus_overlap`
+table, which records every overlapping pair of coding genes without masking.
+
+###### errors masking nothing:
+An error is recorded whether or not it masks anything: a wrong starting phase never does, and an
+error extended into a flank masks nothing where there is no unclaimed sequence, e.g. the missing
+5' UTR of a gene nested inside another. It still counts in the import statistics and is named in
+the filtered GFF3 export's geenuff_errors attribute. A gene dropped for an overlap has its errors
+recorded too, without a mask and outside the import statistics, so that why it was dropped in
+favor of its partner can be looked up.
 
 ##### start_is_biological_start and end_is_biological_end:
 When `True`, these attributes mean the start and end attributes
@@ -43,47 +109,160 @@ of a feature correspond to a meaningful biological transition.
 * start: start of a region, inclusive
   * geenuff_transcript --> transcription start site (1st transcribed bp)
   * geenuff_cds --> start codon, the A of the ATG
-  * geenuf_intron --> donor splice site, first bp of intron
+  * geenuff_intron --> donor splice site, first bp of intron
 * end: end of a region, exclusive (i.e. start of one there after)
   * geenuff_transcript --> 1 after transcription termination site (1st non-transcribed bp)
-  * geenuf_cds --> 1 after stop codon, first non-coding bp, e.g. the N in TGAN
+  * geenuff_cds --> 1 after stop codon, first non-coding bp, e.g. the N in TGAN
   * geenuff_intron --> 1 after acceptor splice site (1st bp that is part of final transcript)
 
-When `False`, these attributes mean the start and end attributes
-of a feature either do not, or it is not known if they correspond
-to a biological transition, yet the region they delineate is
-confidently of the given type. 
+When `False`, the start or end is not, or not known to be, a biological transition, though the
+region is confidently of its type. E.g. where the first exon and the first CDS start at the same
+position (+ strand), the 5' UTR is missing: the transcript's start_is_biological_start is False
+and the range upstream of the CDS is masked, as it is unclear which part is UTR and which
+intergenic.
 
-For instance, if the parser finds a gene model in a gff where the
-start of the first exon and the start of the first CDS (+ strand)
-have the same position (the A in ATG), then it is apparent that
-we are missing the 5' UTR, so for the geenuff_transcript feature
-the start_is_biological_start will be set to False, and an
-error mask will be added upstream of the CDS. We are still confident
-that all of the CDS must occur within the transcript, we know
-the start codon is part of the transcript region, but we mark that the start point
-itself is probably wrong, and mask the upstream range as it's 
-unclear what part of this is intergenic and which part UTR.
- 
 #### feature start/end/at numbering
 
-Features have start and end coordinates that
-delineate a range. 
+Features delineate a range counted from 0, start inclusive, end exclusive: "geenuff_cds, start" is
+the A of the ATG, the first coding bp, and "geenuff_cds, end" the first non-coding bp after the
+stop codon.
 
-The positioning of these features is in keeping with the common
-coordinate system: count from 0, start inclusive, end exclusive. 
-So, the "geenuff_cds, start", is at the A, of the ATG, AKA the first
-coding base pair; while in contrast, the "geenuff_cds, end" is
-after the stop-codon, AKA, the first non-coding bp.
+##### matching sequence IDs
+
+Each GFF sequence ID must be identical to a FASTA ID (the header up to its first whitespace). A GFF
+ID that is no FASTA ID, e.g. `Chr1` beside `Chr1.v2`, stops the import with an error listing them;
+`rename_gff_seqids.py` pairs sequences renamed after annotation by their sequence and renames them.
+Reading the GFF stops at a `##FASTA` line or a line starting with `>`.
+
+##### lines outside their sequence
+
+Lines starting before position 1 or ending past the length of their sequence come from an
+annotation of another assembly version, or from a gene crossing the origin of a circular molecule
+written with an end past its length. What lies beyond cannot be read to check it or label it, and
+a line starting before the sequence could not even be stored.
+
+A coding transcript with such an mRNA, exon or CDS line is clipped to the part on the sequence, its
+exon and CDS lines wholly beyond being left out, and masked whole with both flanks
+(`beyond_sequence_edge`): where it ends is unknown, and its CDS cannot be checked. Its exons are
+not read, so it gets no introns, nothing under the mask being labeled. A transcript with no CDS
+line on the sequence is left out entirely, and its gene is kept out of exports
+(`excluded_from_export = 'outside_sequence'`), counted in the import summary. Trans-spliced genes,
+written with a start past their end or on no definite strand, stay out of exports unmasked (see
+docs/trans_splicing.md): whether and where the intron between their parts lies is unknown.
+
+##### stop codons left out of the CDS
+
+GTF writes the stop codon as a line of its own and leaves it out of the CDS, and GFF3 converted from
+GTF can keep it that way. Where a CDS is whole (no inframe stop, truncation, ...) but for its stop
+codon, its lines not overlapping and lying within the exons (different from
+`filter_longest_transcripts.py`), and the next 3 bases are one, the CDS is extended by them, as
+translation ends there whatever the file says:
+- along the transcript's exons, across an intron if need be
+- where the exons end first (CDS lines only, or exons ending with the CDS), the 3 bases after the
+  last exon, the last exon and the transcript being extended to hold them
+
+A stop codon further on is not looked for, as it would make a longer protein than the file
+annotates. The start codon is not recovered, GTF counting it as part of the CDS, so a missing one
+is likely a real error. The import summary counts the CDS extended, so a file converted from GTF
+shows as such.
+
+##### grouping lines into genes
+
+Lines are grouped into genes by their `ID` and `Parent` attributes, whatever their order in the
+file. The import summary counts every line left out per reason and GFF type, the lines below it
+under the same reason (e.g. the transcripts of a gene line with a shared ID under `shared_id`),
+and the coding transcripts, i.e. potential training data, each reason cost.
+
+- Gene and transcript lines need an `ID`, being the lines others name as their parent; one without
+  an `ID`, or sharing it with another gene or transcript line, is left out. Exon, CDS and UTR lines
+  need no `ID`, and CDS lines sharing one `ID` are normal.
+- Feature types are the Sequence Ontology's, plus three common non-SO spellings: NCBI's `lnc_RNA`
+  as a transcript, and AUGUSTUS' lowercase `five_prime_utr` and `three_prime_utr` as UTRs, so that
+  exons built from CDS and UTR lines keep the UTRs.
+- A transcript names exactly one gene:
+  - one naming several genes or a transcript, even itself, is left out (`add_gene_lines.py` gives
+    one naming itself its gene instead)
+  - coding transcripts naming no parent at all, as gene predictors such as AUGUSTUS and Tiberius
+    write them, stop the import with an error pointing to `add_gene_lines.py`; non-coding ones,
+    e.g. organelle ncRNAs in NCBI annotations, are left out, giving no training data
+  - transcripts naming a `Parent` that matches no line share a gene inferred for them, spanning
+    them all, unless they lie on different sequences or strands: then which belong together cannot
+    be told, and all are left out
+- An exon, CDS or UTR line is put under every transcript it names. One naming a gene that has
+  transcripts is left out unmasked, whether or not it duplicates a line of that gene's
+  transcripts, as it could equally belong to an isoform without a transcript line:
+  - the summary counts such CDS lines per gene, and the genes left non-coding by them; where the
+    gene's only transcript has no exon, CDS or UTR lines yet, `add_transcript_lines.py` puts them
+    under it
+  - non-coding genes give no labels and are not masked, so their bases are labeled intergenic;
+    genes with CDS lines directly parented to them BUT with an mRNA line with non-CDS features
+    (rare) would be judged as non-coding since their only legitimate transcript appears to be
+    non-coding
+  - where over 2.5 % of the genes are this way the import warns to leave the genome out of
+    training, as it is difficult for a general script to tell whether those CDS lines belong to
+    one isoform
+- An exon or UTR line naming no transcript otherwise is left out. CDS lines naming no transcript
+  otherwise are masked (`floating_cds`) rather than turned into gene models, whose CDS, exons and
+  UTRs would have to be guessed from IDs every source writes differently; masked, their sequence is
+  not taught as intergenic:
+  - they are grouped by a shared `ID` (else one by one) where they name no parent, by the `Parent`
+    where it matches no line, and by the gene where it has no transcripts
+    (`add_transcript_lines.py` gives such genes an mRNA before import; only use for single isoform
+    gff files!)
+  - each group gets a transcript spanning it, under its gene or one created for it, masked whole
+    with both flanks, and overlaps like any gene masked outright
+  - a group is left out if its lines lie on different sequences or strands, or on another one than
+    the gene they name
+- A transcript with CDS lines but no exon lines gets exons built from its CDS and UTR lines, lines
+  that touch forming one exon. Overlapping lines stay apart, so that the overlap is found as an
+  error.
+- A line on another sequence than its parent is left out.
+- Attributes are read as `tag=value` pairs split at the first `=`, ignoring spaces around a pair
+  and a trailing `;`. A tag given twice on a line has its values joined, as if separated by commas
+  (`Parent=t1;Parent=t2` as `Parent=t1,t2`), and a `Parent` naming the same ID twice
+  (`Parent=tx1,tx1`) names it once.
+
+##### import summary
+
+The summary is a funnel from the GFF lines down to Helixer's training labels:
+1. GFF lines
+2. GFF gene lines
+3. Genes imported
+4. Genes with transcripts
+5. Coding genes
+6. Exported coding genes (one transcript each)
+7. Genes giving labels
+
+Below each step stands what was subtracted on the way to the next one, and why, so the counts
+add up; counts of 0 are left out, transcript counts are given in brackets.
+- The **Exported coding genes** list the errors masking genes in full, once per type and
+  transcript, and their UTRs each gene in one line: both annotated, only missing 5' or 3', or both
+  missing.
+- The **Genes giving labels** are split by the UTR flanks masked beside them: none, one or both.
+  The length of the UTR mask can be zero for lack of room, e.g. gene starts/ends exactly at a
+  sequence edge or lies directly beside another exported gene. As the masks are stored merged, a
+  0-length flank mask can be missed only in the very rare (probably impossible) case where a 1 bp
+  gap beside the gene is covered by the overhang of a gene dropped in its favor. These overhangs in
+  general are counted apart, being no part of the gene itself.
+
+The summary ends with:
+- the total number of overlapping genes masked (overlaps only counted on the same strand +/-)
+- the bases masked as a share of both strands
+- the bases masked as a share of the bases of the exported genes (both strands combined, for
+  overlapping genes the union of their spans is used). Missing UTRs have no known length and are
+  not counted, so where most genes lack their UTRs this share can look very good however much
+  flank sequence is masked; the share of both strands above counts those flanks, but also all
+  other masked bases
+
+The complete lists of the GFF types skipped are logged with `--verbose`. Where no gene, or fewer
+than one in ten of the coding transcripts read, gives labels, a warning after the summary names
+the largest loss and the scripts preparing a GFF3 file for import (see `docs/scripts.md`).
 
 ##### reverse complement
 
-Importantly, the coding-start should always point to the first
-A, of ATG, regardless of strand. This means the numeric coordinates
-have to change and unfortunately while one could take the
-sequence \[1, 4) on the + strand, and directly use 1 and 4 as python coordinates
-and get the sequence; the same is not going to work on the minus strand.
-Instead: 
+The coding start always points to the A of the ATG, whatever the strand. On the + strand the
+sequence \[1, 4) can be sliced with 1 and 4 directly as python coordinates; on the minus strand it
+cannot:
 
 ```
  0  1  2  3  4  5
@@ -92,9 +271,8 @@ Instead:
  N. T. A. C. N. N.
 ```
 
-To get the reverse complement of this on the minus strand, we set the
-inclusive start to 3, and exclusive end to 0. Note this is now off by 
-one from the python coordinates
+For the reverse complement on the minus strand, the inclusive start is 3 and the exclusive end 0,
+one off from the python coordinates:
 
 
 ```
@@ -105,32 +283,29 @@ one from the python coordinates
 ```
 
 ##### differences vs gff
-Cheat sheet for how the Features compare to the gff (in particular any discrepancy
-between the closest coordinate in the gff, and the now standardized, consistent coordinate).
-
-First and last for gff are reported as they are typically in gff (coordinate sorted),
-so reverse to the interpretation when on the - strand. 
+How the features' coordinates compare to the closest GFF coordinate. First and last are as in a
+coordinate-sorted GFF, so reversed on the - strand.
 
 Plus strand (+)
 
-| Common Name  | GFF | GFF start | GFF end |geenuff type| bearing| position |
-| -------------|:----| ---------:|--------:|:---|:-------|--------:|
-| TSS, Transcription start site      | start 1st exon  |x| |geenuff_transcript |start|x - 1|
-| TTS, Transcription termination site| end last exon   | |x|geenuff_transcript |end  |x    |
-| 1st bp of start codon              | start 1st CDS   |x| |geenuff_cds        |start|x - 1|
-| coding end                         | end last CDS    | |x|geenuff_cds        |end  |x    |
-| donor splice site (5' of intron)   |end non-last exon| |x|geenuff_intron     |start|x    |
-| acceptor splice site (3' of intron)|start 2nd+ exon  |x| |geenuff_intron     |end  |x - 1|
+| Common Name                         | GFF               | GFF start | GFF end | geenuff type       | bearing | position |
+|-------------------------------------|:------------------|----------:|--------:|:-------------------|:--------|---------:|
+| TSS, Transcription start site       | start 1st exon    |         x |         | geenuff_transcript | start   |    x - 1 |
+| TTS, Transcription termination site | end last exon     |           |       x | geenuff_transcript | end     |        x |
+| 1st bp of start codon               | start 1st CDS     |         x |         | geenuff_cds        | start   |    x - 1 |
+| coding end                          | end last CDS      |           |       x | geenuff_cds        | end     |        x |
+| donor splice site (5' of intron)    | end non-last exon |           |       x | geenuff_intron     | start   |        x |
+| acceptor splice site (3' of intron) | start 2nd+ exon   |         x |         | geenuff_intron     | end     |    x - 1 |
 
 
 Minus strand (-)
 
-| Common Name  | GFF | GFF start | GFF end |genuff type| bearing| position|
-| -------------|:----| ---------:|--------:|:---|:-------|--------:|
-| TSS, Transcription start site      | end last exon   | |x|geenuff_transcript |start|x - 1|
-| TTS, Transcription termination site| start 1st exon  |x| |geenuff_transcript |end  |x - 2|
-| 1st bp of start codon              | end last CDS    | |x|geenuff_cds        |start|x - 1|
-| coding end                         | start 1st CDS   |x| |geenuff_cds        |end  |x - 2|
-| donor splice site (5' of intron)   |start 2nd+ exon  |x| |geenuff_intron     |start|x - 2|
-| acceptor splice site (3' of intron)|end non-last exon| |x|geenuff_intron     |end  |x - 1|
+| Common Name                         | GFF               | GFF start | GFF end | geenuff type       | bearing | position |
+|-------------------------------------|:------------------|----------:|--------:|:-------------------|:--------|---------:|
+| TSS, Transcription start site       | end last exon     |           |       x | geenuff_transcript | start   |    x - 1 |
+| TTS, Transcription termination site | start 1st exon    |         x |         | geenuff_transcript | end     |    x - 2 |
+| 1st bp of start codon               | end last CDS      |           |       x | geenuff_cds        | start   |    x - 1 |
+| coding end                          | start 1st CDS     |         x |         | geenuff_cds        | end     |    x - 2 |
+| donor splice site (5' of intron)    | start 2nd+ exon   |         x |         | geenuff_intron     | start   |    x - 2 |
+| acceptor splice site (3' of intron) | end non-last exon |           |       x | geenuff_intron     | end     |    x - 1 |
 

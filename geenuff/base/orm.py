@@ -1,13 +1,20 @@
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy import Table, Column, Integer, ForeignKey, String, Enum, CheckConstraint, UniqueConstraint, Boolean, Float
-from sqlalchemy.orm import relationship
+import bisect
 
-from . import types
+from sqlalchemy import (Table, Column, Integer, ForeignKey, String, Enum, CheckConstraint, UniqueConstraint, Boolean,
+                        Float)
+from sqlalchemy.orm import declarative_base, relationship
+
+from geenuff.base import types
 
 # setup classes for data holding
 Base = declarative_base()
+# Enum and Boolean columns are given create_constraint=True: SQLAlchemy 1.4 writes their CHECK constraints
+# only when asked, and they are the only check of the values the importer's bulk inserts write as plain strings
 
+# bases per row of the sequence_chunk table, well below SQLite's limit of 1,000,000,000 bytes per value
+SEQUENCE_CHUNK_SIZE = 100_000_000
 
+# todo , give option to report/provide this as a yaml or json?
 class Genome(Base):
     __tablename__ = 'genome'
 
@@ -16,21 +23,25 @@ class Genome(Base):
     accession = Column(String)
     version = Column(String)
     acquired_from = Column(String)
-    coordinates = relationship("Coordinate", back_populates="genome")
+    # where the genome was imported from, by which GeenuFF version and when (ISO 8601)
+    fasta_path = Column(String)
+    gff_path = Column(String)
+    geenuff_version = Column(String)
+    imported = Column(String)
+    coordinates = relationship('Coordinate', back_populates='genome')
 
     __table_args__ = (
         UniqueConstraint('species', 'version', name='unique_genome_species_and_version'),
     )
 
     def __repr__(self):
-        return '<Genome {}, species: {}>'.format(self.id, self.species)
+        return f'<Genome {self.id}, species: {self.species}>'
 
 
 class Coordinate(Base):
     __tablename__ = 'coordinate'
 
     id = Column(Integer, primary_key=True)
-    sequence = Column(String)
     length = Column(Integer)
     seqid = Column(String, nullable=False)
     sha1 = Column(String)
@@ -38,16 +49,58 @@ class Coordinate(Base):
     genome = relationship('Genome', back_populates='coordinates')
 
     features = relationship('Feature', back_populates='coordinate')
+    # the sequence in pieces, as SQLite holds at most 1,000,000,000 bytes in one value
+    chunks = relationship('SequenceChunk', back_populates='coordinate', order_by='SequenceChunk.start',
+                          cascade='all, delete-orphan')
 
     __table_args__ = (
         UniqueConstraint('genome_id', 'seqid', name='unique_coords_per_genome'),
         CheckConstraint('length >= 0', name='check_positive_length'),
     )
 
+    @property
+    def sequence(self) -> str | None:
+        """The whole sequence, None where none was stored; joined from its chunks on each call, so
+        for slices use sequence_range."""
+        if not self.chunks:
+            return None
+        return ''.join(chunk.sequence for chunk in self.chunks)
+
+    @sequence.setter
+    def sequence(self, sequence: str) -> None:
+        self.chunks = [SequenceChunk(start=start, sequence=sequence[start:start + SEQUENCE_CHUNK_SIZE])
+                       for start in range(0, max(len(sequence), 1), SEQUENCE_CHUNK_SIZE)]
+
+    def sequence_range(self, start: int, end: int) -> str:
+        """sequence[start:end], from the chunks overlapping the range only; start is clipped to 0."""
+        start = max(start, 0)
+        chunks = self.chunks
+        first = max(bisect.bisect_right([chunk.start for chunk in chunks], start) - 1, 0)
+        pieces = []
+        for chunk in chunks[first:]:
+            if chunk.start >= end:
+                break
+            pieces.append(chunk.sequence[max(start - chunk.start, 0):end - chunk.start])
+        return ''.join(pieces)
+
     def __repr__(self):
-        return '<Coordinate {}, seqid: {}, len: {}, genome_id: {}, genome: {}>'.format(self.id, self.seqid, self.length,
-                                                                                       self.genome_id,
-                                                                                       self.genome.species)
+        return (f'<Coordinate {self.id}, seqid: {self.seqid}, len: {self.length}, genome_id: {self.genome_id}, '
+                f'genome: {self.genome.species}>')
+
+
+class SequenceChunk(Base):
+    """A piece of a Coordinate's sequence of up to SEQUENCE_CHUNK_SIZE bases, starting at start."""
+    __tablename__ = 'sequence_chunk'
+
+    id = Column(Integer, primary_key=True)
+    coordinate_id = Column(Integer, ForeignKey('coordinate.id'), nullable=False, index=True)
+    start = Column(Integer, nullable=False)
+    sequence = Column(String, nullable=False)
+    coordinate = relationship('Coordinate', back_populates='chunks')
+
+    __table_args__ = (
+        UniqueConstraint('coordinate_id', 'start', name='unique_chunk_start_per_coordinate'),
+    )
 
 
 class SuperLocus(Base):
@@ -60,28 +113,60 @@ class SuperLocus(Base):
     id = Column(Integer, primary_key=True)
     given_name = Column(String)
     aliases = Column(String)
-    type = Column(Enum(types.SuperLocusAll), index=True)
+    type = Column(Enum(types.SuperLocusAll, create_constraint=True), index=True)
+    # why this locus is left out of exports, NULL where it is exported normally. Its features are
+    # kept either way: the annotation is recorded as given, and only what a consumer is handed
+    # depends on this. Set where there is no honest way to export the locus at all, rather than
+    # where something about it is merely wrong, which is what errors and their masks are for.
+    excluded_from_export = Column(String, index=True)
+    # its transcripts left out of the database while importing, and the coding ones among them, so
+    # that summarize_geenuff_db.py can rebuild the import summary
+    dropped_transcripts = Column(Integer, nullable=False, default=0)
+    dropped_coding_transcripts = Column(Integer, nullable=False, default=0)
     # things SuperLocus can have a lot of
     transcripts = relationship('Transcript', back_populates='super_locus')
     proteins = relationship('Protein', back_populates='super_locus')
 
     def __repr__(self):
-        return '<SuperLocus {}, given_name: \'{}\', type: {}>'.format(self.id, self.given_name,
-                                                                      self.type.value)
+        return f'<SuperLocus {self.id}, given_name: \'{self.given_name}\', type: {self.type.value}>'
 
 
-association_transcript_piece_to_feature = Table('association_transcript_piece_to_feature', Base.metadata,
+association_transcript_piece_to_feature = Table(
+    'association_transcript_piece_to_feature', Base.metadata,
     Column('transcript_piece_id', Integer, ForeignKey('transcript_piece.id'), nullable=False, index=True),
     Column('feature_id', Integer, ForeignKey('feature.id'), nullable=False, index=True)
 )
 
 
-association_protein_to_feature = Table('association_protein_to_feature', Base.metadata,
+association_protein_to_feature = Table(
+    'association_protein_to_feature', Base.metadata,
     Column('protein_id', Integer, ForeignKey('protein.id'), nullable=False, index=True),
     Column('feature_id', Integer, ForeignKey('feature.id'), nullable=False, index=True)
 )
 
-association_transcript_to_protein = Table('association_transcript_to_protein', Base.metadata,
+
+# One row per unordered pair of coding super loci sharing genomic range, with the shared range
+# itself. Measured over every coding transcript a locus has, not only the exported one, so it is
+# the wider record of the annotation's geometry and carries no judgment about whether either
+# locus is usable. Loci with no CDS under them take no part, a bare gene line or a non-coding
+# gene not being something this can say anything about.
+# The masking counterpart is the geenuff_mask feature of a kept gene, with its
+# super_loci_overlap_error, written only where two exported genes collide (see
+# docs/overlap_masking.md), so consumers that mask from geenuff_mask features never see this table.
+# Both ids are listed, so all overlaps of one locus are
+# `WHERE super_locus_id = X OR partner_id = X`.
+super_locus_overlap = Table(
+    'super_locus_overlap', Base.metadata,
+    Column('super_locus_id', Integer, ForeignKey('super_locus.id'), nullable=False, index=True),
+    Column('partner_id', Integer, ForeignKey('super_locus.id'), nullable=False, index=True),
+    Column('start', Integer, nullable=False),
+    Column('end', Integer, nullable=False),
+    Column('is_plus_strand', Boolean(create_constraint=True), nullable=False),
+    Column('coordinate_id', Integer, ForeignKey('coordinate.id'), nullable=False, index=True)
+)
+
+association_transcript_to_protein = Table(
+    'association_transcript_to_protein', Base.metadata,
     Column('transcript_id', Integer, ForeignKey('transcript.id'), nullable=False, index=True),
     Column('protein_id', Integer, ForeignKey('protein.id'), nullable=False, index=True)
 )
@@ -93,8 +178,8 @@ class Transcript(Base):
     id = Column(Integer, primary_key=True)
     given_name = Column(String)
 
-    type = Column(Enum(types.TranscriptLevel), index=True)
-    longest = Column(Boolean, index=True)
+    type = Column(Enum(types.TranscriptLevel, create_constraint=True), index=True)
+    longest = Column(Boolean(create_constraint=True), index=True)
 
     super_locus_id = Column(Integer, ForeignKey('super_locus.id'), nullable=False, index=True)
     super_locus = relationship('SuperLocus', back_populates='transcripts')
@@ -104,11 +189,29 @@ class Transcript(Base):
     proteins = relationship('Protein', secondary=association_transcript_to_protein,
                             back_populates='transcripts')
 
+    errors = relationship('TranscriptError', back_populates='transcript')
+
     def __repr__(self):
-        return '<Transcript, {}, "{}" of type {}, with {} pieces>'.format(self.id,
-                                                                          self.given_name,
-                                                                          self.type,
-                                                                          len(self.transcript_pieces))
+        return (f'<Transcript, {self.id}, "{self.given_name}" of type {self.type}, '
+                f'with {len(self.transcript_pieces)} pieces>')
+
+
+class TranscriptError(Base):
+    """One error type found for a transcript. Where it is masked is not recorded per error: all
+    errors of a transcript are merged into its geenuff_mask features."""
+    __tablename__ = 'transcript_error'
+
+    id = Column(Integer, primary_key=True)
+    transcript_id = Column(Integer, ForeignKey('transcript.id'), nullable=False, index=True)
+    transcript = relationship('Transcript', back_populates='errors')
+    type = Column(Enum(types.Errors, create_constraint=True), nullable=False, index=True)
+
+    __table_args__ = (
+        UniqueConstraint('transcript_id', 'type', name='unique_error_per_transcript'),
+    )
+
+    def __repr__(self):
+        return f'<TranscriptError {self.id}, transcript {self.transcript_id}: {self.type.value}>'
 
 
 class TranscriptPiece(Base):
@@ -130,8 +233,8 @@ class TranscriptPiece(Base):
     )
 
     def __repr__(self):
-        return ('<TranscriptPiece, {}: for transcript {} '
-                'in position {}>').format(self.id, self.transcript_id, self.position)
+        return (f'<TranscriptPiece, {self.id}: for transcript {self.transcript_id} '
+                f'in position {self.position}>')
 
 
 class Protein(Base):
@@ -150,9 +253,7 @@ class Protein(Base):
                                back_populates='proteins')
 
     def __repr__(self):
-        return '<Protein {}, given_name: \'{}\', super_locus_id: {}>'.format(self.id,
-                                                                             self.given_name,
-                                                                             self.super_locus_id)
+        return f'<Protein {self.id}, given_name: \'{self.given_name}\', super_locus_id: {self.super_locus_id}>'
 
 
 class Feature(Base):
@@ -160,14 +261,14 @@ class Feature(Base):
     # basic attributes
     id = Column(Integer, primary_key=True)
     given_name = Column(String)
-    type = Column(Enum(types.GeenuffFeature), index=True)
+    type = Column(Enum(types.GeenuffFeature, create_constraint=True), index=True)
 
     start = Column(Integer, nullable=False)
-    start_is_biological_start = Column(Boolean, nullable=False)
+    start_is_biological_start = Column(Boolean(create_constraint=True), nullable=False)
     end = Column(Integer, nullable=False)
-    end_is_biological_end = Column(Boolean, nullable=False)
+    end_is_biological_end = Column(Boolean(create_constraint=True), nullable=False)
 
-    is_plus_strand = Column(Boolean, nullable=False)
+    is_plus_strand = Column(Boolean(create_constraint=True), nullable=False)
     score = Column(Float)
     source = Column(String)
     phase = Column(Integer)
@@ -178,12 +279,12 @@ class Feature(Base):
 
     # relations
     transcript_pieces = relationship('TranscriptPiece',
-                                      secondary=association_transcript_piece_to_feature,
-                                      back_populates='features')
+                                     secondary=association_transcript_piece_to_feature,
+                                     back_populates='features')
 
     proteins = relationship('Protein',
-                               secondary=association_protein_to_feature,
-                               back_populates='features')
+                            secondary=association_protein_to_feature,
+                            back_populates='features')
 
     __table_args__ = (
         UniqueConstraint('coordinate_id', 'type', 'start', 'end', 'is_plus_strand', 'given_name',
@@ -208,11 +309,7 @@ class Feature(Base):
             end_caveat = '?'
         elif self.end_is_biological_end is False:
             end_caveat = '*'
-        s = ('<Feature, id: {pk}, given_name: \'{givenid}\', type: {type}, '
-             '{start}{start_caveat}--{end}{end_caveat}, on {coor}, '
-             'is_plus: {plus}, phase: {phase}>').format(
-                pk=self.id, start_caveat=start_caveat, end_caveat=end_caveat,
-                type=self.type.value, start=self.start, end=self.end, coor=self.coordinate,
-                plus=self.is_plus_strand, phase=self.phase, givenid=self.given_name
-            )
+        s = (f'<Feature, id: {self.id}, given_name: \'{self.given_name}\', type: {self.type.value}, '
+             f'{self.start}{start_caveat}--{self.end}{end_caveat}, on {self.coordinate}, '
+             f'is_plus: {self.is_plus_strand}, phase: {self.phase}>')
         return s

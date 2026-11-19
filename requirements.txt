@@ -1,7 +1,11 @@
-intervaltree
-sqlalchemy
-numpy
-git+https://github.com/janinamass/dustdas@master
-# for testing only
-pytest
+# Kept in step with the dependencies in pyproject.toml, which is what an install actually reads.
+# Installing GeenuFF itself (pip install .) pulls these in already; this file is for setting up
+# an environment without the package, e.g. to run the tests from the working tree.
+intervaltree>=3.0.2
+# 2.0 dropped Engine.execute and raw string execution, both of which are still used here
+SQLAlchemy==1.4.54
+numpy>=1.18.1
 pyyaml
+# gzip compression and decompression in threads for the scripts' FASTA and GFF3 files
+zlib-ng>=1.0.0
+pytest>=5.3.4

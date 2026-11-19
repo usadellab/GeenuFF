@@ -1,83 +1,144 @@
+from __future__ import annotations
+
 import sys
 import copy
 import time
+import logging
 import intervaltree
 import argparse
 from collections import defaultdict
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, TextIO
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect
 from sqlalchemy.orm import sessionmaker
 
 from geenuff.base.orm import (Coordinate, Genome, Feature, Transcript, TranscriptPiece,
                               association_transcript_piece_to_feature as asso_tp_2_f, SuperLocus)
 from geenuff.base.handlers import TranscriptHandlerBase, SuperLocusHandlerBase
-from geenuff.base.helpers import full_db_path, Counter, in_enum_values
+from geenuff.base.helpers import (full_db_path, Counter, in_enum_values, add_version_arg, check_output_paths,
+                                  require_input_files)
 from geenuff.base import types
+
+if TYPE_CHECKING:
+    from sqlalchemy.engine import RowProxy
+
+    from geenuff.applications.importer import FeatureImporter
+
+# this module is called from inside Helixer's export pipeline (helixer/export/exporter.py),
+# which configures a logger named exactly 'HelixerLogger' (see helixer/core/helpers.py's
+# get_log_dict()) with its own handler/formatter; matching that name here means these
+# messages show up through that same configured handler instead of being silently dropped
+# by the otherwise-unconfigured root logger
+logger = logging.getLogger('HelixerLogger')
+FEATURE_TYPES = {feature_type.value: feature_type for feature_type in types.GeenuffFeature}
+
+
+@dataclass(slots=True)
+class QueriedFeature:
+    """A feature as genome_query returns it, with the columns of orm.Feature as plain attributes. Its
+    callers only read them, and building one is many times faster than building an orm.Feature."""
+    id: int
+    given_name: str | None
+    type: types.GeenuffFeature
+    start: int
+    start_is_biological_start: bool
+    end: int
+    end_is_biological_end: bool
+    is_plus_strand: bool
+    score: float | None
+    source: str | None
+    phase: int | None
+    coordinate_id: int
+
+
+# {(coordinate ID, coordinate length): its features}, as genome_query returns them
+CoordFeatures = dict[tuple[int, int], list[QueriedFeature]]
 
 
 class ExportArgParser(object):
-    def __init__(self):
+    def __init__(self) -> None:
         self.parser = argparse.ArgumentParser()
+        add_version_arg(self.parser)
         self.parser.add_argument('--db-path-in', type=str, required=True,
                                  help='Path to the Geenuff SQLite input database.')
-        self.parser.add_argument('-l', '--longest', action="store_true",
-                                 help="ignore all but the longest transcript per gene")
-        self.parser.add_argument('-o', '--out', type=str,
-                                 help="output fasta file path, (default is stdout)")
+        self.parser.add_argument('-l', '--longest', action='store_true',
+                                 help='ignore all but the longest coding transcript per gene, the one selected '
+                                      'for export')
+        self.parser.add_argument('-o', '--out', type=str, required=True,
+                                 help='output file path')
 
-        self.args = None
+        self.args: argparse.Namespace | None = None
 
-    def parse_args(self):
+    def parse_args(self) -> None:
         self.args = self.parser.parse_args()
+        require_input_files(self.parser, [self.args.db_path_in])
+        check_output_paths(self.parser, [self.args.out], [self.args.db_path_in])
 
 
 class RangeArgParser(ExportArgParser):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.parser.add_argument('-m', '--mode', type=str, required=True,
-                                 help="which type of sequence to export, one of {}".format(list(MODES.keys())))
+                                 help=f'which type of sequence to export, one of {list(MODES.keys())}')
+        self.parser.add_argument('--coding', action='store_true',
+                                 help=f'only transcripts with a CDS, whatever their GFF3 types, every isoform '
+                                      f"unless --longest; the modes {', '.join(CODING_MODES)} need it or --longest")
+
+    def parse_args(self) -> None:
+        super().parse_args()
+        if self.args.mode in CODING_MODES and not (self.args.coding or self.args.longest):
+            self.parser.error(f'--mode {self.args.mode} needs --coding or --longest, as only a transcript with '
+                              f'a CDS has a CDS or UTRs')
 
 
 class GeenuffExportController(object):
-    def __init__(self, db_path_in, longest=False):
+    def __init__(self, db_path_in: str, longest: bool = False, coding: bool = False, all_types: bool = False) -> None:
         self.db_path_in = db_path_in
         self._mk_session()
         self.longest = longest
+        self.coding = coding
+        self.all_types = all_types
         self.id_counter = Counter()
-        self.export_ranges = []
+        self.export_ranges: list[ExportGroup] = []
 
     @staticmethod
-    def _as_file_handle(file_out):
+    def _as_file_handle(file_out: str | None) -> TextIO:
         if file_out is None:
             handle_out = sys.stdout
         else:
-            handle_out = open(file_out, "w")
+            handle_out = open(file_out, 'w')
         return handle_out
 
-    def _mk_session(self):
+    def _mk_session(self) -> None:
         self.engine = create_engine(full_db_path(self.db_path_in), echo=False)
+        if 'sequence_chunk' not in inspect(self.engine).get_table_names():
+            raise ValueError(f'"{self.db_path_in}" was written by a GeenuFF storing each sequence in one row '
+                             f'i.e. (version <= 0.3.2); import the genome again')
         self.session = sessionmaker(bind=self.engine)()
 
-    def get_coord_by_id(self, coord_id):
+    def get_coord_by_id(self, coord_id: int) -> Coordinate:
         return self.session.query(Coordinate).filter(Coordinate.id == coord_id).one()
 
-    def genome_query(self, longest_only=True, return_super_loci=False, include_non_coding=False):
-        """Returns either a tuple of (super_loci, coordinate_seqid) or a dict of coord_ids for everything in the database
-        that each link to a list of features. If all_transcripts is False, only the
+    def genome_query(self, longest_only: bool = True, return_super_loci: bool = False,
+                     include_non_coding: bool = False) -> CoordFeatures | list[tuple[SuperLocus, str]]:
+        """Returns either a tuple of (super_loci, coordinate_seqid) or a dict of coord_ids for everything in
+        the database that each link to a list of features. If longest_only is True, only the
         features of the longest transcript are queried."""
 
-        print(f'Querying for {self.session.query(Genome.species).all()[0]}', file=sys.stderr)
+        logger.info(f'Querying for {self.session.query(Genome.species).all()[0]}')
         if return_super_loci:
             return self._super_loci_query()
         else:
             return self._genome_query(longest_only, include_non_coding)
 
-    def _filter_to_coding(self, rows):
+    def _filter_to_coding(self, rows: list[RowProxy]) -> list[RowProxy]:
         """aggregates rows by matching transcript ID, and filters any resulting aggregate without at least one CDS"""
         seen = set()
         out = []
         for grp, t_id, has_cds in self._aggregate_by_transcript(rows):
-            assert t_id not in seen, f"This should be sorted by transcript id, but {t_id} found in > 1 sort location?!?"
+            assert t_id not in seen, f'This should be sorted by transcript id, but {t_id} found in > 1 sort location?!?'
             seen.add(t_id)
             # keep only transcripts that have >= 1 CDS feature
             if has_cds:
@@ -85,7 +146,7 @@ class GeenuffExportController(object):
         return out
 
     @staticmethod
-    def _aggregate_by_transcript(rows):
+    def _aggregate_by_transcript(rows: list[RowProxy]) -> Iterator[tuple[list[RowProxy], int | None, bool]]:
         prev_transcript_id = None
         prev_rows = []
         has_cds = False
@@ -103,15 +164,17 @@ class GeenuffExportController(object):
                 has_cds = True
         yield prev_rows, prev_transcript_id, has_cds
 
-    def _genome_query(self, longest_only, include_non_coding):
+    def _genome_query(self, longest_only: bool, include_non_coding: bool) -> CoordFeatures:
         # returns dictionary
         # {(coordinate pk, coordinate length):
-        #     [Feature 0, Feature 1, ...]
+        #     [QueriedFeature 0, QueriedFeature 1, ...]
         # }
+        # a locus with no honest way to be exported is left out whatever else is asked for; its
+        # features stay in the database (see orm.SuperLocus.excluded_from_export)
+        conditions = ['super_locus.excluded_from_export IS NULL']
         if longest_only:
-            longest_transcript_filter = 'WHERE transcript.longest = 1'
-        else:
-            longest_transcript_filter = ''
+            conditions.append('transcript.longest = 1')
+        longest_transcript_filter = 'WHERE ' + ' AND '.join(conditions)
 
         query = '''SELECT feature.id AS feature_id,
                           feature.given_name AS feature_given_name,
@@ -143,27 +206,16 @@ class GeenuffExportController(object):
         rows = self.engine.execute(query).fetchall()
 
         end_q_time = time.time()
-        print(f'Query took {end_q_time - start:.2f}s')
+        logger.debug(f'Query took {end_q_time - start:.2f}s')
 
         # for many purposes we
         if not include_non_coding:
             rows = self._filter_to_coding(rows)
-            print(f'filter to coding only took {time.time() - end_q_time:.2f}s')
+            logger.debug(f'filter to coding only took {time.time() - end_q_time:.2f}s')
 
         coord_features = defaultdict(list)
         for row in rows:
-            feature = Feature(id=row[0],
-                              given_name=row[1],
-                              type=types.GeenuffFeature(row[2]),
-                              start=row[3],
-                              start_is_biological_start=row[4],
-                              end=row[5],
-                              end_is_biological_end=row[6],
-                              is_plus_strand=row[7],
-                              score=row[8],
-                              source=row[9],
-                              phase=row[10],
-                              coordinate_id=row[11])
+            feature = QueriedFeature(row[0], row[1], FEATURE_TYPES[row[2]], *row[3:12])
             # reorganizing rows into genome centric dict
             coord_id, coord_len = row[12], row[13]
             coord_features[(coord_id, coord_len)].append(feature)
@@ -181,46 +233,65 @@ class GeenuffExportController(object):
             resorted[coord] = features
         coord_features = resorted
 
+        n_features = sum(len(features) for features in coord_features.values())
+        logger.info(f'Found {n_features} features across {len(coord_features)} coordinates')
         return coord_features
 
-    def _super_loci_query(self):
+    def _super_loci_query(self) -> list[tuple[SuperLocus, str]]:
         # returns a list of results like [(SuperLocus obj, sequence_name str), ...]
         query = (self.session.query(SuperLocus, Coordinate.seqid).distinct()
-                    .join(Transcript, Transcript.super_locus_id == SuperLocus.id)
-                    .join(TranscriptPiece, TranscriptPiece.transcript_id == Transcript.id)
-                    .join(asso_tp_2_f, asso_tp_2_f.c.transcript_piece_id == TranscriptPiece.id)
-                    .join(Feature, asso_tp_2_f.c.feature_id == Feature.id)
-                    .join(Coordinate, Feature.coordinate_id == Coordinate.id)
-                    .filter(Transcript.type.in_([types.TranscriptLevel.mRNA, types.TranscriptLevel.transcript]))
-                    .filter(SuperLocus.type == types.SuperLocusAll.gene)
-                    .order_by(Genome.species)
-                    .order_by(Coordinate.length.desc())
-                    .order_by(Feature.is_plus_strand)
-                    .order_by(Feature.start))
-
+                     .join(Transcript, Transcript.super_locus_id == SuperLocus.id)
+                     .join(TranscriptPiece, TranscriptPiece.transcript_id == Transcript.id)
+                     .join(asso_tp_2_f, asso_tp_2_f.c.transcript_piece_id == TranscriptPiece.id)
+                     .join(Feature, asso_tp_2_f.c.feature_id == Feature.id)
+                     .join(Coordinate, Feature.coordinate_id == Coordinate.id)
+                     .join(Genome, Coordinate.genome_id == Genome.id))
+        # the longest transcripts are the coding ones selected for export, whatever their types,
+        # as in the h5 export, and coding ones are selected by their CDS (see SuperLocusRanger);
+        # otherwise all isoforms are those of plain genes, mRNAs and transcripts, unless all types
+        # are asked for
+        if not (self.longest or self.coding or self.all_types):
+            query = (query.filter(Transcript.type.in_([types.TranscriptLevel.mRNA, types.TranscriptLevel.transcript]))
+                          .filter(SuperLocus.type == types.SuperLocusAll.gene))
+        query = (query.order_by(Genome.species)
+                      .order_by(Coordinate.length.desc())
+                      .order_by(Feature.is_plus_strand)
+                      .order_by(Feature.start))
         return query.all()
 
-    def gen_ranges(self, range_function):
+    def gen_ranges(self, range_function: RangeFunction) -> Iterator[ExportGroup]:
         # the coordinate centric ranges get special handling
         if range_function == IG_OVERRIDE:
             for item in self.intergenic_ranges():
                 yield item
             return
 
-        # all super locus centric ranges
+        # all super locus centric ranges; a locus whose strand or coordinates cannot be placed is
+        # left out, and with longest also one dropped for an overlap, as in the h5 export
         super_loci = [r[0] for r in self.genome_query(return_super_loci=True)]
         for super_locus in super_loci:
-            sl_ranger = SuperLocusRanger(super_locus, longest=self.longest)
+            reason = super_locus.excluded_from_export
+            if reason in types.unrepresentable_reasons or (self.longest and reason is not None):
+                continue
+            sl_ranger = SuperLocusRanger(super_locus, longest=self.longest, coding=self.coding)
             # todo, once JOIN output exists, drop all these loops
             for range_maker in sl_ranger.exp_range_makers:
                 export_groups = range_function(range_maker)
                 for group in export_groups:
                     if group.seqid is None:
-                        group.seqid = 'unnamed_{0:08d}'.format(self.id_counter())
+                        group.seqid = f'unnamed_{self.id_counter():08d}'
                     yield group
 
-    def intergenic_ranges(self):
+    @staticmethod
+    def _region_name(seqid: str, a_range: Range) -> str:
+        """seqid:start-end(strand), 1-based, inclusive and ascending as in GFF3."""
+        if a_range.is_plus_strand:
+            return f'{seqid}:{a_range.start + 1}-{a_range.end}(+)'
+        return f'{seqid}:{a_range.end + 2}-{a_range.start + 1}(-)'
+
+    def intergenic_ranges(self) -> list[ExportGroup]:
         # todo gen
+        logger.info('Computing intergenic ranges')
         coords = self.session.query(Coordinate.id, Coordinate.length)
         super_loci = self.genome_query(return_super_loci=True)
         groups = []
@@ -243,7 +314,7 @@ class GeenuffExportController(object):
             transcripts_as_groups = []
             for sl, coord_seqid in super_loci:
                 if coord_seqid == seqid:
-                    sl_ranger = SuperLocusRanger(sl, longest=self.longest)
+                    sl_ranger = SuperLocusRanger(sl, longest=self.longest, coding=self.coding)
                     for range_maker in sl_ranger.exp_range_makers:
                         transcripts_as_groups += RangeMaker.transcribed_ranges(range_maker)
             plus_transcripts = []
@@ -265,44 +336,46 @@ class GeenuffExportController(object):
             # subtract transcripts from intergenic
             plus_subtracted = dummy_handler._subtract_ranges(plus_ranges, plus_transcripts)
             minus_subtracted = dummy_handler._subtract_ranges(minus_ranges, minus_transcripts)
-            groups += dummy_handler._one_range_one_group(plus_subtracted) + \
-                      dummy_handler._one_range_one_group(minus_subtracted)
+            groups += [ExportGroup(seqid=self._region_name(seqid, r), ranges=[r])
+                       for r in plus_subtracted + minus_subtracted]
+        logger.info(f'Computed {len(groups)} intergenic ranges')
         return groups
 
-    def prep_ranges(self, range_function):
+    def prep_ranges(self, range_function: RangeFunction) -> None:
+        mode = getattr(range_function, '__name__', range_function)
+        logger.info(f'Preparing export ranges (mode: {mode})')
         for arange in self.gen_ranges(range_function):
             self.export_ranges.append(arange)
+        logger.info(f'Prepared {len(self.export_ranges)} export ranges')
 
 
-def positional_match(feature, previous):
+def positional_match(feature: FeatureImporter, previous: FeatureImporter) -> bool:
     return feature.pos_cmp_key() == previous.pos_cmp_key()
 
 
 class TranscriptCoordinate(object):
     """holds (and helps sort) either start or end, with the sequence, piece position, and direction"""
-    def __init__(self, coordinate_id, piece_position, is_plus_strand, start):
+    def __init__(self, coordinate_id: int, piece_position: int, is_plus_strand: bool, start: int) -> None:
         self.start = start
         self.coordinate_id = coordinate_id
         self.piece_position = piece_position
         self.is_plus_strand = is_plus_strand
 
-    def _sort_pos(self, pos):
+    def _sort_pos(self, pos: int) -> int:
         if self.is_plus_strand:
             sort_pos = pos
         else:
             sort_pos = -pos  # flip sort order on the - strand
         return sort_pos
 
-    def sort_key(self):
+    def sort_key(self) -> tuple[int, ...]:
         return self.piece_position, self._sort_pos(self.start)
 
-    def __repr__(self):
-        return "coordinate: {}, piece position {}, is_plus {}: {}".format(self.coordinate_id,
-                                                                          self.piece_position,
-                                                                          self.is_plus_strand,
-                                                                          self.start)
+    def __repr__(self) -> str:
+        return (f'coordinate: {self.coordinate_id}, piece position {self.piece_position}, '
+                f'is_plus {self.is_plus_strand}: {self.start}')
 
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool:
         if isinstance(other, TranscriptCoordinate):
             return self.__dict__ == other.__dict__
         return False
@@ -310,7 +383,8 @@ class TranscriptCoordinate(object):
 
 class Range(TranscriptCoordinate):
     """holds (and helps sort) a start-end range with the sequence, piece position, and direction"""
-    def __init__(self, coordinate_id, piece_position, start, end, is_plus_strand, given_name=None):
+    def __init__(self, coordinate_id: int, piece_position: int, start: int, end: int, is_plus_strand: bool,
+                 given_name: str | None = None) -> None:
         super().__init__(coordinate_id=coordinate_id,
                          piece_position=piece_position,
                          is_plus_strand=is_plus_strand,
@@ -318,43 +392,45 @@ class Range(TranscriptCoordinate):
         self.end = end
         self.given_name = given_name
 
-    def sequence_chunk_info(self):
+    def sequence_chunk_info(self) -> tuple[int, int, bool]:
         return self.coordinate_id, self.piece_position, self.is_plus_strand
 
-    def sort_key(self):
+    def sort_key(self) -> tuple[int, ...]:
         return self.piece_position, self._sort_pos(self.start), self._sort_pos(self.end)
 
-    def __repr__(self):
-        return "coordinate: {}, piece position {}, is_plus {}: {}-{}".format(self.coordinate_id,
-                                                                             self.piece_position,
-                                                                             self.is_plus_strand,
-                                                                             self.start,
-                                                                             self.end)
+    def __repr__(self) -> str:
+        return (f'coordinate: {self.coordinate_id}, piece position {self.piece_position}, '
+                f'is_plus {self.is_plus_strand}: {self.start}-{self.end}')
 
 
 class ExportGroup(object):
     """Holds a named list of ordered ranges which should be combined to make a sequence (think all exons for an mRNA)"""
-    def __init__(self, seqid, ranges=None):
+    def __init__(self, seqid: str | None, ranges: list[Range] | None = None) -> None:
         if ranges is None:
             self.ranges = []
         else:
             self.ranges = ranges
         self.seqid = seqid
 
-    def __repr__(self):
-        return 'ExportGroup with id={} and ranges {}'.format(self.seqid, self.ranges)
+    def __repr__(self) -> str:
+        return f'ExportGroup with id={self.seqid} and ranges {self.ranges}'
+
+
+# a range or the end of one, the side ('subtract_from' or 'to_subtract') it belongs to, and how it
+# changes that side's depth (1 opening, -1 closing), see RangeMaker._subtract_ranges
+DepthCoord = tuple[TranscriptCoordinate, str, int]
 
 
 class RangeMaker(TranscriptHandlerBase):
     """Interprets a transcript as ordered flattened ranges from its features"""
 
-    def feature_piece_pairs(self):
+    def feature_piece_pairs(self) -> Iterator[tuple[Feature, TranscriptPiece]]:
         for piece in self.data.transcript_pieces:
             for feature in piece.features:
                 yield feature, piece
 
     # helpers for classic transitions below
-    def _ranges_by_type(self, target_type):
+    def _ranges_by_type(self, target_type: str) -> list[Range]:
         ranges = []
         for feature, piece in self.feature_piece_pairs():
             if feature.type.value == target_type:  # and 0 is simply ignored...
@@ -368,7 +444,7 @@ class RangeMaker(TranscriptHandlerBase):
         return ranges
 
     @staticmethod
-    def _copy_ival_data(iv, islower):
+    def _copy_ival_data(iv: intervaltree.Interval, islower: bool) -> object:
         if islower:  # copy one of the two sides so that we don't change the same dictionary later
             out = copy.deepcopy(iv.data)
         else:
@@ -376,7 +452,7 @@ class RangeMaker(TranscriptHandlerBase):
         return out
 
     @staticmethod
-    def _stack_matching(pos_tuples):
+    def _stack_matching(pos_tuples: list[DepthCoord]) -> Iterator[list[DepthCoord]]:
         prev_start = None
         matching = []
         for pos in pos_tuples:
@@ -388,9 +464,12 @@ class RangeMaker(TranscriptHandlerBase):
             prev_start = pos[0].start
         yield matching
 
-    def _subtract_ranges(self, subtract_from, to_subtract):
+    def _subtract_ranges(self, subtract_from: list[Range], to_subtract: list[Range]) -> list[Range]:
         """makes new ranges that are the difference between subtract_from and to_subtract"""
-        # todo, this may break if more than one transcript piece is present
+        # todo, this may break if more than one transcript piece is present. Not urgent:
+        # nothing in the importer creates multi-piece transcripts today (TranscriptPieceImporter
+        # is always position=0), so this is dormant. Revisit carefully if that ever changes,
+        # e.g. if multi-piece/trans-spliced transcript import is added.
         if not to_subtract:
             return self._resort_subtracted(subtract_from)
 
@@ -427,14 +506,14 @@ class RangeMaker(TranscriptHandlerBase):
         return self._resort_subtracted(out)
 
     @staticmethod
-    def _is_in_difference(depths):
+    def _is_in_difference(depths: dict[str, int]) -> bool:
         if depths['subtract_from'] > 0 and depths['to_subtract'] == 0:
             return True
         else:
             return False
 
     @staticmethod
-    def _mk_depth_counter_coords(ranges, label):
+    def _mk_depth_counter_coords(ranges: list[Range], label: str) -> list[DepthCoord]:
         """semi flatten ranges to coordinates and how the 'depth' changes"""
         coords = []
         for range in ranges:
@@ -446,33 +525,33 @@ class RangeMaker(TranscriptHandlerBase):
         return coords
 
     @staticmethod
-    def _resort_subtracted(subtracted_ranges):
+    def _resort_subtracted(subtracted_ranges: list[Range]) -> list[Range]:
         return sorted(subtracted_ranges, key=lambda x: x.sort_key())
 
     @staticmethod
-    def _one_range_one_group(ranges):
+    def _one_range_one_group(ranges: list[Range]) -> list[ExportGroup]:
         return [ExportGroup(seqid=r.given_name, ranges=[r]) for r in ranges]
 
     # common 'interpretations' or extractions of transcript-related data
-    # all of the following methods should return a ready "ExportGroup" that has all the ordered ranges
+    # all the following methods should return a ready "ExportGroup" that has all the ordered ranges
     # that need to be combined to form a sequence, and an id for this sequence
-    def transcribed_ranges(self):
+    def transcribed_ranges(self) -> list[ExportGroup]:
         return [ExportGroup(seqid=self.data.given_name,
                             ranges=self._ranges_by_type(types.GEENUFF_TRANSCRIPT))]
 
-    def cds_ranges(self):
+    def cds_ranges(self) -> list[ExportGroup]:
         return self._one_range_one_group(self._ranges_by_type(types.GEENUFF_CDS))
 
-    def intronic_ranges(self):
+    def intronic_ranges(self) -> list[ExportGroup]:
         return self._one_range_one_group(self._ranges_by_type(types.GEENUFF_INTRON))
 
-    def exonic_ranges(self):  # AKA exon
+    def exonic_ranges(self) -> list[ExportGroup]:  # AKA exon
         transcribeds = self._ranges_by_type(types.GEENUFF_TRANSCRIPT)
         introns = self._ranges_by_type(types.GEENUFF_INTRON)
         exons = self._subtract_ranges(subtract_from=transcribeds, to_subtract=introns)
         return self._one_range_one_group(exons)
 
-    def cds_exonic_ranges(self):  # AKA CDS
+    def cds_exonic_ranges(self) -> list[ExportGroup]:  # AKA CDS
         # todo, somewhere, maybe not here, consider further consistency checking
         #  e.g. (that all CODING regions are within TRANSCRIBED regions)
         # todo, return separately if CDS features are connected to different proteins
@@ -481,22 +560,22 @@ class RangeMaker(TranscriptHandlerBase):
         coding_exons = self._subtract_ranges(subtract_from=geenuff_cds, to_subtract=introns)
         return self._one_range_one_group(coding_exons)
 
-    def untranslated_exonic_ranges(self):  # AKA UTR
+    def untranslated_exonic_ranges(self) -> list[ExportGroup]:  # AKA UTR
         exons = self.exonic_ranges()
         geenuff_cds = self._ranges_by_type(types.GEENUFF_CDS)
         utrs = self._subtract_ranges(subtract_from=exons, to_subtract=geenuff_cds)
         return self._one_range_one_group(utrs)
 
-    def mature_RNA(self):
+    def mature_RNA(self) -> list[ExportGroup]:
         exons = self.exonic_ranges()
         return [ExportGroup(seqid=self.data.given_name, ranges=[x.ranges[0] for x in exons])]
 
-    def mature_CDS(self):
+    def mature_CDS(self) -> list[ExportGroup]:
         # todo, operon logic!!
         cds = self.cds_exonic_ranges()
         return [ExportGroup(seqid=self.data.given_name, ranges=[x.ranges[0] for x in cds])]
 
-    def mature_UTR(self):
+    def mature_UTR(self) -> list[ExportGroup]:
         # subtract CDS
         # for each unprocessed UTR
         #  --> export group
@@ -509,122 +588,82 @@ class RangeMaker(TranscriptHandlerBase):
         i = 0
         for pre_utr in pre_utrs:
             utr = self._subtract_ranges(subtract_from=[pre_utr], to_subtract=introns)
-            out.append(ExportGroup(seqid='{}_UTR{:02d}'.format(self.data.given_name, i), ranges=utr))
+            out.append(ExportGroup(seqid=f'{self.data.given_name}_UTR{i:02d}', ranges=utr))
             i += 1
         return out
 
-    def pre_UTR(self):
+    def pre_UTR(self) -> list[ExportGroup]:
         # subtract
         transcript = self._ranges_by_type(types.GEENUFF_TRANSCRIPT)
         coding = self._ranges_by_type(types.GEENUFF_CDS)
         pre_utrs = self._subtract_ranges(subtract_from=transcript, to_subtract=coding)
         return self._one_range_one_group(pre_utrs)
 
-    def utr3p(self):
+    def utr3p(self) -> None:
         pass  # todo
 
-    def utr5p(self):
+    def utr5p(self) -> None:
         pass  # todo
 
-    # point transitions (sites)
     @staticmethod
-    def _get_transition(feature, target_start_not_end):
-        if target_start_not_end:
-            at = feature.start
-            is_bio = feature.start_is_biological_start
-        else:
-            at = feature.end
-            is_bio = feature.end_is_biological_end
-        return at, is_bio
-
-    def get_by_type_and_bearing(self, target_type, target_start_not_end, target_is_biological=True):
-        out = []
-        for piece in self.data.transcribed_pieces:
-            for feature in piece.features:
-                if feature.type.value == target_type:
-                    at, is_bio = self._get_transition(feature, target_start_not_end)
-                    if is_bio == target_is_biological:
-                        out.append(TranscriptCoordinate(coordinate_id=feature.coordinate_id,
-                                                        piece_position=piece.position,
-                                                        is_plus_strand=feature.is_plus_strand,
-                                                        start=at))
-        return out
-
-    def transcript_start_sites(self):
-        return self.get_by_type_and_bearing(types.GEENUFF_TRANSCRIPT, target_start_not_end=True)
-
-    def cds_start_sites(self):  # AKA start codons
-        return self.get_by_type_and_bearing(types.GEENUFF_CDS, target_start_not_end=True)
-
-    def intron_start_sites(self):  # AKA Donor splice site
-        return self.get_by_type_and_bearing(types.GEENUFF_INTRON, target_start_not_end=True)
-
-    def transcript_end_sites(self):
-        return self.get_by_type_and_bearing(types.GEENUFF_TRANSCRIPT, target_start_not_end=False)
-
-    def cds_end_sites(self):  # AKA follows stop codons
-        return self.get_by_type_and_bearing(types.GEENUFF_CDS, target_start_not_end=False)
-
-    def intron_end_sites(self):  # AKA follows acceptor splice site
-        return self.get_by_type_and_bearing(types.GEENUFF_INTRON, target_start_not_end=False)
-
-    @staticmethod
-    def _sum_range_lengths(ranges):
+    def _sum_range_lengths(ranges: list[Range]) -> int:
         out = 0
         for arange in ranges:
             out += abs(arange.end - arange.start)  # abs should make it work on - strand
         return out
 
-    def sum_exonic_lengths(self):
+    def sum_exonic_lengths(self) -> int:
         ranges = [x.ranges[0] for x in self.exonic_ranges()]
         return self._sum_range_lengths(ranges)
 
-    def sum_exonic_cds_lengths(self):
+    def sum_exonic_cds_lengths(self) -> int:
         ranges = [x.ranges[0] for x in self.cds_exonic_ranges()]
         return self._sum_range_lengths(ranges)
 
 
-IG_OVERRIDE = "intergenic_override"
+IG_OVERRIDE = 'intergenic_override'
+# what a mode exports: a RangeMaker method giving its ranges, or IG_OVERRIDE for the ranges between genes
+RangeFunction = Callable[[RangeMaker], list[ExportGroup]] | str
 
-MODES = {"mRNA": RangeMaker.mature_RNA,
-         "pre-mRNA": RangeMaker.transcribed_ranges,
-         "CDS": RangeMaker.mature_CDS,
-         "exons": RangeMaker.exonic_ranges,
-         "introns": RangeMaker.intronic_ranges,
-         "UTR": RangeMaker.mature_UTR,
-         "pre-UTR": RangeMaker.pre_UTR,
-         "intergenic": IG_OVERRIDE}
+MODES: dict[str, RangeFunction] = {'mRNA': RangeMaker.mature_RNA,
+         'pre-mRNA': RangeMaker.transcribed_ranges,
+         'CDS': RangeMaker.mature_CDS,
+         'exons': RangeMaker.exonic_ranges,
+         'introns': RangeMaker.intronic_ranges,
+         'UTR': RangeMaker.mature_UTR,
+         'pre-UTR': RangeMaker.pre_UTR,
+         'intergenic': IG_OVERRIDE}
+# modes defined only for transcripts with a CDS
+CODING_MODES = ('CDS', 'UTR', 'pre-UTR')
 
 
 class SuperLocusRanger(SuperLocusHandlerBase):
-    def __init__(self, data=None, longest=False, setup_range_makers=True):
+    def __init__(self, data: SuperLocus | None = None, longest: bool = False, setup_range_makers: bool = True,
+                 coding: bool = False) -> None:
         super().__init__(data)
         self.longest = longest
-        self.range_makers = []
-        self.exp_range_makers = []
+        self.coding = coding
+        self.range_makers: list[RangeMaker] = []
+        self.exp_range_makers: list[RangeMaker] = []
         if setup_range_makers:
             self.setup_range_makers()
 
-    def setup_range_makers(self):
+    def setup_range_makers(self) -> None:
         for transcript in self.data.transcripts:
             range_maker = RangeMaker(transcript)
             self.range_makers.append(range_maker)
-        if not self.longest:
-            self.exp_range_makers = self.range_makers
+        if self.longest:
+            # the transcript the importer selected for export, as the h5 export uses (see
+            # OrganizedGeenuffImporterGroup._set_longest_transript); none for a gene without a
+            # coding one
+            self.exp_range_makers = [rm for rm in self.range_makers if rm.data.longest]
+        elif self.coding:
+            self.exp_range_makers = [rm for rm in self.range_makers
+                                     if any(feature.type.value == types.GEENUFF_CDS
+                                            for feature, _ in rm.feature_piece_pairs())]
         else:
-            long_transcript, _ = self.get_longest_transcript()
-            self.exp_range_makers = [long_transcript]
+            self.exp_range_makers = self.range_makers
 
-    def get_longest_transcript(self):
-        """identify which transcript in this super locus is longest (with introns removed)"""
-        transcript, length = None, 0
-        for range_maker in self.range_makers:
-            rm_length = range_maker.sum_exonic_lengths()
-            if rm_length > length:
-                transcript = range_maker
-                length = rm_length
-        return transcript, length
-
-    def get_longest_protein_in_transcript(self):
+    def get_longest_protein_in_transcript(self) -> None:
         """identify which transcript, protein_id makes longest final coding sequence (introns rm) in this super locus"""
         pass

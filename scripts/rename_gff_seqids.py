@@ -1,0 +1,750 @@
+#! /usr/bin/env python3
+"""Rewrites the sequence IDs of a GFF3 file to those of its FASTA file, for sequences renamed after
+annotation. Lines on sequence IDs without a FASTA sequence are left out; sequences changed
+after annotation are left out of both files, the FASTA file being copied without them.
+See https://github.com/usadellab/GeenuFF/blob/main/docs/scripts.md for more.
+"""
+import argparse
+import bisect
+import itertools
+import logging
+import math
+import os
+import re
+from collections import defaultdict
+from dataclasses import dataclass, field
+
+from geenuff.base.helpers import (DEFAULT_COMPRESSION_LEVEL, DEFAULT_THREADS, add_output_compression_args,
+                                  add_version_arg, built_exon_spans, check_output_paths, codon_after_cds,
+                                  compression_for, insert_before_extension, listed, output_compression, output_path,
+                                  require_fasta_and_gff, require_input_files, run_main, setup_logging,
+                                  write_fasta_without, write_gff_without)
+from geenuff.base.types import PIECE_KEYS, TRANSCRIPT_TYPES
+from geenuff.parsing.fastahelper import FastaParser, text_or_gzip_open
+from geenuff.parsing.gffhelper import GFFObject, GFFParser
+
+logger = logging.getLogger(__name__)
+
+# an intron is checked at both ends at once, for GT-AG or GC-AG, which 99.5-99.8% of introns are; the
+# rarer kinds, such as AT-AC (about 0.1%), fail their check (docs/scripts.md)
+MOTIFS = {'start': {'ATG'}, 'stop': {'TAA', 'TAG', 'TGA'}, 'intron': {'GTAG', 'GCAG'}}
+# a stop codon at the end of the CDS or right after it, where GFF3 converted from GTF leaves it out
+STOP_OR_NEXT = 'stop_or_next'
+# the chance of a random position passing each check
+RANDOM_PASS = {'start': 1 / 64, 'stop': 3 / 64, STOP_OR_NEXT: 6 / 64, 'intron': 2 / 256}
+COMPLEMENT = str.maketrans('ACGT', 'TGCA')
+# (kind, 0-based position on the plus strand, is_plus, 0-based positions): for a codon check its
+# bases' positions in reading order, read across an intron where it is split by one (the start codon,
+# or for STOP_OR_NEXT the stop codon and the codon after the CDS, see cds_end_codons, codon_after);
+# for an intron the first positions of its 2 bases at either end
+Check = tuple[str, int, bool, tuple[int, ...]]
+# A check is one position where the GFF3 file places a start codon, a stop codon or an intron, tested
+# for the bases expected there; a transcript with n introns gives 2 + n checks.
+# At most MAX_CHECKS per sequence ID, spread evenly along it, far more than needed to tell its sequence
+# from others
+MAX_CHECKS = 250
+# pairs by ID or full name: the share of its checks a gene must pass, and the share of genes in each
+# window that must pass; a random sequence passes about 3% of the checks
+MIN_NAMED_SCORE = 0.5
+# the share of its checks a pair found by search must pass. A GFF3 sequence is only searched where a
+# wrong sequence reaching this share by chance stays below MAX_RANDOM_HITS, so a higher share needs
+# fewer checks (a chance 80% is rarer than a chance 50%) and lets smaller scaffolds be searched, while
+# rejecting more right pairs of poorer annotations. On a 26,720-sequence assembly (Catagonium nitens,
+# NCBI GCA_050002935.1), 0.8 let 6,507 of 10,335 sequences be searched, from 6 checks on, and rejected
+# 10 right pairs, 0.7 6,097 with 1 rejected, and 0.9 7,482 but with 586 rejected; right pairs with 20
+# checks or more passed at least 0.90
+MIN_SEARCHED_SCORE = 0.8
+MAX_RANDOM_HITS = 1e-3  # expected random sequences passing the checks of a pair found by search
+# the number of genes with checks a pair by ID or full name needs to be judged by them, and the size of
+# its first and last window. Judged by genes, not checks, one gene with many poor checks, such as
+# introns annotated a few bases off, cannot sink a window alone. On a wrong sequence a gene passes in
+# about 4% of cases (Catagonium nitens, NCBI GCA_050002935.1), so 4 of 8 pass by chance in about 1e-4,
+# and of the genes of a poor annotation passing in 80% of cases, 4 of 8 fail in about 1%
+MIN_DECISIVE_GENES = 8
+# a pair with fewer genes is judged by its checks where it has at least MIN_DECISIVE_CHECKS of them, and
+# fails below MIN_FEW_GENES_SCORE: a changed sequence passes about 3% of the checks, the right one with
+# a poor annotation of partial genes 35-45% (wheat survey contigs, Phytozome T. aestivum v2.2), so this
+# share tells the two apart where half of the checks would not
+MIN_DECISIVE_CHECKS = 20
+MIN_FEW_GENES_SCORE = 0.25
+# a pair by ID or full name is judged in windows of about this many consecutive genes along the
+# sequence, each of which must pass; after a piece cut out of or put into the FASTA sequence all
+# genes fail, however many before it pass
+WINDOW_GENES = 10
+# at most this many genes per sequence ID are judged, the first and last MIN_DECISIVE_GENES and the rest
+# spread evenly between them
+MAX_GENES = 100
+MAX_CHANGED_SHARE = 0.05  # of the coding transcripts, on sequences changed after annotation
+MAX_MISSING_SHARE = 0.15  # of the coding transcripts, on sequences matching no FASTA sequence
+OUT_SUFFIX = '_renamed'  # inserted before the extension of the GFF3 file's name for the default output
+ADVICE = ('Renaming cannot fix this; use the FASTA file the GFF3 file was made on, or transfer the annotation '
+          'to this assembly (e.g. with Liftoff).')
+
+
+class MismatchedFiles(Exception):
+    pass
+
+
+@dataclass
+class StopSite:
+    transcript_id: str
+    codon: tuple[int, int, int]  # the last codon of the CDS (see cds_end_codons)
+    is_plus: bool
+    exon_beyond: bool  # whether its exons reach 3 bases or more past the CDS
+    after: tuple[int, int, int]  # the codon following the CDS (see codon_after)
+
+
+@dataclass
+class GffSequence:
+    max_end: int = 0
+    region_length: int | None = None  # from a ##sequence-region line
+    n_lines: int = 0
+    coding_transcripts: int = 0
+    checks: list[Check] = field(default_factory=list)
+    genes: list[list[Check]] = field(default_factory=list)  # the checks of each gene, sorted along the sequence
+    stops: list[StopSite] = field(default_factory=list)
+
+
+@dataclass
+class Pair:
+    fasta_id: str
+    method: str  # 'id', 'full_name' or 'sequence'
+    passed: int
+    checks: int
+
+
+@dataclass
+class Pairing:
+    pairs: dict[str, Pair]  # by GFF3 sequence ID
+    changed: dict[str, tuple[str, str]]  # GFF3 sequence ID: (FASTA ID, why their genes do not fit it)
+    duplicates: dict[str, str] = field(default_factory=dict)  # GFF3 sequence ID: FASTA ID paired already
+
+
+def cds_end_codons(cds: list[tuple[int, int]], is_plus: bool) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """The 0-based plus-strand positions of a CDS's first and last codon, each in reading order and read
+    along the CDS lines, so across an intron where it is split by one."""
+    # the 3 lowest and the 3 highest CDS bases, taken from the CDS lines without listing them all
+    ascending = (p for start, end in sorted(cds) for p in range(start, end + 1))
+    descending = (p for start, end in sorted(cds, reverse=True) for p in range(end, start - 1, -1))
+    low, high = list(itertools.islice(ascending, 3)), list(itertools.islice(descending, 3))
+    # reading runs up the plus strand and down the minus strand, so the start codon is the low end on
+    # the plus strand and the high end on the minus strand
+    first, last = (low, high[::-1]) if is_plus else (high, low[::-1])
+    return tuple(p - 1 for p in first), tuple(p - 1 for p in last)
+
+
+def codon_after(cds: list[tuple[int, int]], exons: list[tuple[int, int]], is_plus: bool) -> tuple[int, int, int]:
+    """The 0-based plus-strand positions of the 3 bases following a transcript's CDS, in reading order,
+    as GeenuFF's import reads them (see geenuff.base.helpers.codon_after_cds)."""
+    return tuple(p - 1 for p in codon_after_cds(cds, exons, is_plus)[0])
+
+
+def transcript_checks(cds: list[tuple[int, int]], exons: list[tuple[int, int]], is_plus: bool) -> list[Check]:
+    """The start and stop codon of a transcript's CDS and the introns between its exons, or its CDS
+    lines without exon lines, as checks (see Check).
+
+    Args:
+        cds: the GFF3 (start, end) of its CDS lines
+        exons: the GFF3 (start, end) of its exon lines
+        is_plus: whether it lies on the plus strand
+    """
+    checks = []
+    if cds:
+        start_codon, stop_codon = cds_end_codons(cds, is_plus)
+        after = codon_after(cds, exons, is_plus)
+        # each sorted along the sequence by its lowest base
+        checks += [('start', min(start_codon), is_plus, start_codon),
+                   (STOP_OR_NEXT, min(stop_codon), is_plus, stop_codon + after)]
+    pieces = sorted(exons or cds)
+    for (_, end), (start, _) in zip(pieces, pieces[1:]):
+        # a gap of under 4 bases is no intron; the check reads its first 2 bases (0-based, the base after
+        # the piece's end) and its last 2, right before the next piece
+        if start - end > 4:
+            checks.append(('intron', end, is_plus, (end, start - 3)))
+    return checks
+
+
+def stop_site(transcript_id: str, cds: list[tuple[int, int]], exons: list[tuple[int, int]],
+              is_plus: bool) -> StopSite:
+    """Where a transcript's CDS ends, and whether its exons go on 3 bases or more past it, which GeenuFF
+    needs to extend the CDS by a stop codon left out of it (see geenuff.base.helpers.codon_after_cds)."""
+    following, n_past = codon_after_cds(cds, exons, is_plus)
+    return StopSite(transcript_id, cds_end_codons(cds, is_plus)[1], is_plus, n_past == 0,
+                    tuple(p - 1 for p in following))
+
+
+def sequence_regions(gff_path: str) -> dict[str, int]:
+    """{sequence ID: length} from the ##sequence-region lines anywhere in a GFF3 file."""
+    regions = {}
+    with text_or_gzip_open(gff_path) as f:
+        for line in f:
+            if line.startswith('##sequence-region'):
+                _, seqid, start, end = line.split()[:4]
+                regions[seqid] = int(end) - int(start) + 1
+    return regions
+
+
+def spread(items: list, n: int, edge: int) -> list:
+    """At most n of the items, the first and last edge of them whole and from the middle every
+    len(middle) / (n - 2 * edge)-th one, i.e. sampled at even steps."""
+    if len(items) <= n:
+        return items
+    middle, n_spread = items[edge:len(items) - edge], n - 2 * edge
+    return items[:edge] + [middle[i * len(middle) // n_spread] for i in range(n_spread)] + items[len(items) - edge:]
+
+
+def check_key(check: Check) -> tuple:
+    return check[1], check
+
+
+def read_gff(gff_path: str) -> dict[str, GffSequence]:
+    """The sequence IDs of a GFF3 file's feature lines, with what is needed to pair and check them."""
+    sequences = defaultdict(GffSequence)
+    # by (seqid, Parent); the exon, CDS and UTR types GeenuFF imports, a line under each transcript it names
+    pieces = defaultdict(lambda: {'cds': [], 'exons': [], 'utrs': [], 'strands': set()})
+    gene_of = {}  # {transcript ID: the one gene it names, else itself}
+    for line in GFFParser.feature_lines(gff_path):
+        seqid, _, feature_type, start, end, _, strand, _, column = line.rstrip('\n').split('\t')[:9]
+        sequences[seqid].max_end = max(sequences[seqid].max_end, int(end))
+        sequences[seqid].n_lines += 1
+        attributes = GFFObject.parse_attributes(column)
+        if feature_type in TRANSCRIPT_TYPES:
+            parents = GFFObject.parents(attributes)
+            gene_of[attributes.get('ID')] = parents[0] if len(parents) == 1 else attributes.get('ID')
+        key = PIECE_KEYS.get(feature_type)
+        if key is None:
+            continue
+        for parent in GFFObject.parents(attributes):
+            transcript = pieces[(seqid, parent)]
+            transcript[key].append((int(start), int(end)))
+            transcript['strands'].add(strand)
+    gene_checks = defaultdict(lambda: defaultdict(set))  # {seqid: {gene ID: its checks}}
+    for (seqid, transcript_id), transcript in pieces.items():
+        sequence = sequences[seqid]
+        sequence.coding_transcripts += bool(transcript['cds'])
+        if transcript['strands'] not in ({'+'}, {'-'}):
+            continue
+        is_plus = transcript['strands'] == {'+'}
+        cds, exons = transcript['cds'], transcript['exons']
+        # without exon lines, the checks read the CDS lines alone: the introns between UTR lines, which
+        # the import makes of them, fail their splice sites often in poorer UTR models (docs/scripts.md)
+        checks = transcript_checks(cds, exons, is_plus)
+        sequence.checks += checks
+        gene_checks[seqid][gene_of.get(transcript_id, transcript_id)].update(checks)
+        if cds:
+            # where the stop codon lies past the CDS, the import extends it along the exons it builds
+            # from the CDS and UTR lines of a transcript without exon lines
+            sequence.stops.append(stop_site(transcript_id, cds, exons or built_exon_spans(cds + transcript['utrs']),
+                                            is_plus))
+    for seqid, sequence in sequences.items():
+        # identical checks, as from isoforms sharing a CDS start or an intron, count once, so that one
+        # gene with many isoforms cannot decide a sequence alone; the checks a search tests are spread
+        # evenly along the sequence, the genes the windows judge keep the first and last ones whole, so
+        # a change anywhere on it shows, also between its first and last genes (see failing_window)
+        sequence.checks = spread(sorted(set(sequence.checks), key=check_key), MAX_CHECKS, 0)
+        genes = sorted((sorted(checks, key=check_key) for checks in gene_checks[seqid].values() if checks),
+                       key=lambda checks: check_key(checks[0]))
+        sequence.genes = spread(genes, MAX_GENES, MIN_DECISIVE_GENES)
+    for seqid, length in sequence_regions(gff_path).items():
+        if seqid in sequences:
+            sequences[seqid].region_length = length
+    return sequences
+
+
+def as_read(sequence: str, max_end: int) -> str:
+    """The sequence as its GFF3 genes read it: where they end past it by less than its own length, its
+    start appended, as GFF3 writes a feature crossing the origin of a circular sequence, its end given
+    as the position past the origin plus the sequence's length."""
+    if len(sequence) < max_end <= 2 * len(sequence):
+        return sequence + sequence[:max_end - len(sequence)]
+    return sequence
+
+
+def codon_at(sequence: str, positions: tuple[int, ...], is_plus: bool) -> str:
+    """The bases at 0-based plus-strand positions in reading order, complemented on the minus strand,
+    or '' where one lies outside the sequence."""
+    if not all(0 <= p < len(sequence) for p in positions):
+        return ''
+    bases = ''.join(sequence[p] for p in positions)
+    return bases if is_plus else bases.translate(COMPLEMENT)
+
+
+def passes(sequence: str, kind: str, position: int, is_plus: bool, positions: tuple[int, ...]) -> bool:
+    """Whether the bases a check tests are the motif expected there (see Check): a codon check reads its
+    codon's positions, a STOP_OR_NEXT check passing where the stop codon or the codon after it is one,
+    an intron check the 2 bases at either end."""
+    if kind == 'start':
+        return codon_at(sequence, positions, is_plus) in MOTIFS['start']
+    if kind == STOP_OR_NEXT:
+        # positions holds the stop codon's 3 positions, then those of the codon after the CDS
+        # (in case the stop codon lies after the CDS, i.e. GTF -> GFF3 conversion)
+        return any(codon_at(sequence, positions[i:i + 3], is_plus) in MOTIFS['stop'] for i in (0, 3))
+    low, high = positions
+    if low < 0 or high + 2 > len(sequence):
+        return False
+    # the intron's ends along the plus strand, read as the reverse complement on the minus strand,
+    # where the low end holds the AG and the high end the GT or GC
+    motif = sequence[low:low + 2] + sequence[high:high + 2]
+    if not is_plus:
+        motif = motif.translate(COMPLEMENT)[::-1]
+    return motif in MOTIFS['intron']
+
+
+def n_passed(sequence: str, checks: list[Check]) -> int:
+    return sum(passes(sequence, *check) for check in checks)
+
+
+def random_pass_log10(checks: list[Check], n: int) -> float:
+    """log10 of an upper bound on the chance that a random sequence passes n of the checks."""
+    # (number of ways to pick the n passing checks) times (the chance of the n easiest to pass all
+    # passing), which bounds every pick from above
+    log_chances = sorted(math.log10(RANDOM_PASS[kind]) for kind, *_ in checks)
+    return math.log10(math.comb(len(checks), n)) + sum(log_chances[len(checks) - n:])
+
+
+def gene_passes(sequence: str, checks: list[Check]) -> bool:
+    return n_passed(sequence, checks) >= MIN_NAMED_SCORE * len(checks)
+
+
+def failing_window(sequence: str, genes: list[list[Check]]) -> str | None:
+    """The first window of consecutive genes along the sequence (see WINDOW_GENES) of which fewer than
+    MIN_NAMED_SCORE pass, a gene passing at least that share of its checks, described, or None where
+    all pass; genes are sorted by position. The first and the last MIN_DECISIVE_GENES genes are windows
+    of their own, a change near an end of the sequence failing too few genes to sink a whole window."""
+    edge = MIN_DECISIVE_GENES
+    # windows of nearly equal size, about WINDOW_GENES each, covering all genes, plus the two edges
+    n_windows = max(1, len(genes) // WINDOW_GENES)
+    bounds = [len(genes) * i // n_windows for i in range(n_windows + 1)]
+    windows = [(0, edge)] + list(zip(bounds, bounds[1:])) + [(len(genes) - edge, len(genes))]
+    for lo, hi in windows:
+        window = genes[lo:hi]
+        passed = sum(gene_passes(sequence, checks) for checks in window)
+        if passed / len(window) < MIN_NAMED_SCORE:
+            return (f'{passed} of {len(window)} genes with their start and stop codons and introns in place, '
+                    f'from {window[0][0][1] + 1} to {max(check[1] for check in window[-1]) + 3} bp')
+    return None
+
+
+def failing_checks(sequence: str, checks: list[Check], n_genes: int) -> str | None:
+    """For a sequence with too few genes for windows (see failing_window), its checks described where
+    fewer than MIN_FEW_GENES_SCORE of them pass, else None."""
+    passed = n_passed(sequence, checks)
+    if passed / len(checks) < MIN_FEW_GENES_SCORE:
+        return f'{passed} of {len(checks)} start and stop codons and introns of its {n_genes} genes in place'
+    return None
+
+
+def full_name_words(full_names: dict[str, str]) -> dict[str, list[str]]:
+    """{word of a FASTA full name: [IDs of the FASTA sequences whose full name holds it]}"""
+    words = defaultdict(list)
+    for fasta_id, full_name in full_names.items():
+        for word in set(re.split(r'[\s,;:|=]+', full_name)):
+            words[word].append(fasta_id)
+    return words
+
+
+def pair_by_id_or_full_name(gff_sequences: dict[str, GffSequence], sequences: dict[str, str],
+                            full_names: dict[str, str]) -> tuple[dict[str, Pair], dict[str, tuple[str, str]], int]:
+    """Pairs each GFF3 sequence ID with the FASTA sequence of the same ID, else the only one whose
+    full name holds it as a word and whose ID is no GFF3 sequence ID, which would pair with it by
+    ID. A pair fails where the GFF3 genes reach past the FASTA sequence by more than its length,
+    its ##sequence-region length differs from the FASTA sequence's by >= 2 bp, or, where the
+    GFF3 sequence has at least MIN_DECISIVE_GENES genes with checks, fewer than MIN_NAMED_SCORE of them
+    (a share) pass in any window of them (see failing_window), else, with at least MIN_DECISIVE_CHECKS
+    checks, fewer than MIN_FEW_GENES_SCORE of them pass (see failing_checks); pairs with neither are
+    logged as paired on ID or full name and length alone. Genes reaching past it by less are read
+    as crossing the origin of a circular sequence (see as_read), and a region 1 bp off, as from one
+    written 0-based, does not judge the pair; both are warned about.
+
+    Returns:
+        the pairs, {GFF3 sequence ID: (FASTA ID, why it failed)} for the failed ones, and how many
+        pairs were tried
+    """
+    words = full_name_words(full_names)
+    pairs, claimed, failed = {}, set(), {}
+    unjudged = []  # GFF3 sequence IDs paired without enough genes or checks to judge the pair
+    one_off = []  # (GFF3 sequence ID, region length, FASTA sequence length)
+    circular = []  # (GFF3 sequence ID, end of its genes, FASTA sequence length, FASTA full name)
+    n_tried = 0
+    for gff_id, gff_sequence in gff_sequences.items():
+        if gff_id in sequences:
+            fasta_id, method = gff_id, 'id'
+        # one full name only holding it, of a FASTA sequence no other GFF3 ID pairs with by ID
+        elif len(words.get(gff_id, ())) == 1 and words[gff_id][0] not in gff_sequences:
+            fasta_id, method = words[gff_id][0], 'full_name'
+        else:
+            continue
+        length, checks = len(sequences[fasta_id]), gff_sequence.checks
+        sequence = as_read(sequences[fasta_id], gff_sequence.max_end)
+        n_tried += 1
+        genes = gff_sequence.genes
+        if len(genes) >= MIN_DECISIVE_GENES:
+            window = failing_window(sequence, genes)
+        elif len(checks) >= MIN_DECISIVE_CHECKS:
+            window = failing_checks(sequence, checks, len(genes))
+        else:
+            window = None
+        region = gff_sequence.region_length
+        if region is not None and abs(region - length) == 1:
+            one_off.append((gff_id, region, length))
+        if len(sequence) > length:
+            circular.append((gff_id, gff_sequence.max_end, length, full_names[fasta_id]))
+        if gff_sequence.max_end > len(sequence):
+            failed[gff_id] = fasta_id, f'genes end at {gff_sequence.max_end}, past its {length} bp'
+        elif region is not None and abs(region - length) > 1:
+            failed[gff_id] = fasta_id, f'{region} bp by ##sequence-region, {length} bp in the FASTA file'
+        elif window is not None:
+            failed[gff_id] = fasta_id, window
+        # a FASTA sequence pairs with one GFF3 ID; a second is left to the search by sequence, which
+        # takes it for a duplicate
+        elif fasta_id not in claimed:
+            passed = n_passed(sequence, checks)
+            pairs[gff_id] = Pair(fasta_id, method, passed, len(checks))
+            claimed.add(fasta_id)
+            if len(genes) < MIN_DECISIVE_GENES and len(checks) < MIN_DECISIVE_CHECKS:
+                unjudged.append(gff_id)
+    if unjudged:
+        n_coding = sum(gff_sequences[gff_id].coding_transcripts for gff_id in unjudged)
+        logger.info(f'{len(unjudged)} of the {n_tried} GFF3 sequence IDs paired by ID or full name have too few '
+                    f'genes and checks to be judged by them, e.g. {listed(unjudged)} (fewer than '
+                    f'{MIN_DECISIVE_GENES} genes and {MIN_DECISIVE_CHECKS} checks), so they are paired on ID or '
+                    f'full name and length alone; they hold {n_coding} coding transcripts')
+    if one_off:
+        examples = ', '.join(f'{gff_id} ({region} bp by ##sequence-region, {length} bp in the FASTA file)'
+                             for gff_id, region, length in one_off[:3])
+        logger.warning(f'{len(one_off)} GFF3 sequences have a ##sequence-region 1 bp off the length of their FASTA '
+                       f'sequence, e.g. {examples}, as when the regions are written 0-based (starting at 0) '
+                       f'instead of 1-based; the regions are not used to judge these pairs, but check that the '
+                       f'GFF3 file\'s coordinates are 1-based and fit the FASTA file')
+    if circular:
+        # the FASTA full name often says what the sequence is, e.g. a chloroplast genome
+        examples = ', '.join(f'{gff_id} (genes end at {end}, its FASTA sequence {length} bp: "{name[:80]}")'
+                             for gff_id, end, length, name in circular[:3])
+        logger.warning(f'{len(circular)} GFF3 sequences have genes ending past their FASTA sequence by less than its '
+                       f'length, e.g. {examples}; they are read as crossing the origin of a circular sequence, as '
+                       f'GFF3 writes such features, and checked so; check that these sequences are circular, e.g. '
+                       f'organelle genomes or plasmids, or were cut at their end after annotation (e.g. trimmed on '
+                       f'upload to NCBI); the import masks genes past the end')
+    return pairs, failed, n_tried
+
+
+def share_passed(pair: Pair) -> float:
+    return pair.passed / pair.checks
+
+
+def pair_by_sequence(gff_sequences: dict[str, GffSequence], sequences: dict[str, str],
+                     claimed: set[str]) -> tuple[dict[str, Pair], dict[str, str]]:
+    """Pairs each GFF3 sequence ID with the FASTA sequence its genes fit in and pass the largest share
+    of their checks on, at least MIN_SEARCHED_SCORE, where a random sequence doing so is unlikely
+    enough for the number of sequences searched. Where several GFF3 sequence IDs fit one FASTA
+    sequence, the best fitting one pairs with it. A tie is logged and goes to the first.
+
+    Returns:
+        the pairs, and {GFF3 sequence ID: FASTA sequence ID} for those whose fitting sequence was
+        claimed already or pairs with a better fitting GFF3 sequence, i.e. duplicates of another
+    """
+    by_length = sorted((len(seq), fasta_id) for fasta_id, seq in sequences.items())
+    lengths = [length for length, _ in by_length]
+    hits = {}
+    ties_fasta = []
+    for gff_id, gff_sequence in gff_sequences.items():
+        checks = gff_sequence.checks
+        # the FASTA sequences long enough to hold its genes, found by bisection in those sorted by length
+        candidates = [fasta_id for _, fasta_id in by_length[bisect.bisect_left(lengths, gff_sequence.max_end):]]
+        min_passed = math.ceil(MIN_SEARCHED_SCORE * len(checks))
+        if not checks or not candidates:
+            continue
+        if random_pass_log10(checks, min_passed) + math.log10(len(candidates)) > math.log10(MAX_RANDOM_HITS):
+            continue  # too few checks to tell its sequence from a random one among this many
+        # a candidate passing under half of 8 checks spread along the sequence, so from different genes
+        # and not sunk by one poor or partial gene, is skipped without testing the rest
+        quick = checks[::max(1, len(checks) // 8)][:8]
+        found = []
+        for fasta_id in candidates:
+            sequence = sequences[fasta_id]
+            if n_passed(sequence, quick) * 2 >= len(quick):
+                passed = n_passed(sequence, checks)
+                if passed >= min_passed:
+                    found.append(Pair(fasta_id, 'sequence', passed, len(checks)))
+        if found:
+            best = max(found, key=share_passed)
+            tied = [pair.fasta_id for pair in found if share_passed(pair) == share_passed(best)]
+            if len(tied) > 1:
+                ties_fasta.append(f'{gff_id} ({listed(tied)})')
+            hits[gff_id] = best
+    if ties_fasta:
+        logger.warning(f'The genes of {len(ties_fasta)} GFF3 sequence IDs fit several FASTA sequences equally well, '
+                       f'each paired with the first, e.g. {listed(ties_fasta, "; ")}')
+    # a hit on a FASTA sequence paired by ID or full name already is a duplicate; of several GFF3 IDs
+    # hitting one FASTA sequence, the best fitting pairs with it and the others are duplicates
+    duplicates = {gff_id: pair.fasta_id for gff_id, pair in hits.items() if pair.fasta_id in claimed}
+    by_fasta_id = defaultdict(list)
+    for gff_id, pair in hits.items():
+        if gff_id not in duplicates:
+            by_fasta_id[pair.fasta_id].append(gff_id)
+    pairs = {}
+    ties_gff = []
+    for fasta_id, gff_ids in by_fasta_id.items():
+        best = max(gff_ids, key=lambda gff_id: share_passed(hits[gff_id]))
+        tied = [gff_id for gff_id in gff_ids if share_passed(hits[gff_id]) == share_passed(hits[best])]
+        if len(tied) > 1:
+            ties_gff.append(f'{fasta_id} ({listed(tied)})')
+        pairs[best] = hits[best]
+        duplicates.update({gff_id: fasta_id for gff_id in gff_ids if gff_id != best})
+    if ties_gff:
+        logger.warning(f'{len(ties_gff)} FASTA sequences fit the genes of several GFF3 sequence IDs equally well, '
+                       f'each paired with the first, the others left out as duplicates, e.g. '
+                       f'{listed(ties_gff, "; ")}')
+    return pairs, duplicates
+
+
+def pair_seqids(gff_sequences: dict[str, GffSequence], sequences: dict[str, str], full_names: dict[str, str],
+                gff_name: str, fasta_name: str, max_missing_share: float = MAX_MISSING_SHARE) -> Pairing:
+    """Pairs the GFF3 sequence IDs by ID or full name, then the rest by sequence. GFF3 sequences
+    whose pair by ID or full name fails are taken for changed after annotation and left unpaired.
+
+    Args:
+        gff_sequences: see read_gff
+        sequences: {FASTA ID: sequence}
+        full_names: {FASTA ID: full name}
+        gff_name: the GFF3 file name, for messages
+        fasta_name: the FASTA file name, for messages
+        max_missing_share: the largest share of the coding transcripts the sequences matching no
+            FASTA sequence may hold
+
+    Raises:
+        MismatchedFiles: if most pairs by ID or full name fail, the changed sequences hold more than
+            MAX_CHANGED_SHARE of the coding transcripts, or the sequences matching no FASTA sequence
+            more than max_missing_share
+    """
+    pairs, changed, n_tried = pair_by_id_or_full_name(gff_sequences, sequences, full_names)
+    examples = [f'{gff_id} ({fasta_id}): {why}' for gff_id, (fasta_id, why) in changed.items()]
+    if len(changed) * 2 > n_tried:
+        raise MismatchedFiles(
+            f'The GFF3 file "{gff_name}" was made on another assembly than the FASTA file "{fasta_name}": '
+            f'{len(changed)} of the {n_tried} GFF3 sequences found in it by ID or full name do not fit their '
+            f'FASTA sequence, e.g. {examples[0]}. {ADVICE}')
+    n_coding = sum(seq.coding_transcripts for seq in gff_sequences.values())
+    n_changed_coding = sum(gff_sequences[gff_id].coding_transcripts for gff_id in changed)
+    if n_changed_coding > MAX_CHANGED_SHARE * n_coding:
+        raise MismatchedFiles(
+            f'{len(changed)} GFF3 sequences of "{gff_name}" found in "{fasta_name}" by ID or full name do not '
+            f'fit their FASTA sequence, which was likely changed after annotation (e.g. trimmed on upload to '
+            f'NCBI), and hold {coding_share(n_changed_coding, n_coding)}, too many to leave out: '
+            f'{"; ".join(examples[:5])}{"; ..." if len(examples) > 5 else ""}. {ADVICE}')
+
+    unpaired = {gff_id: seq for gff_id, seq in gff_sequences.items() if gff_id not in pairs and gff_id not in changed}
+    if not unpaired:
+        return Pairing(pairs, changed)
+    logger.info(f'Searching the FASTA sequences for {len(unpaired)} GFF3 sequence IDs not paired by ID or '
+                f'full name')
+    # the FASTA sequence of a changed GFF3 sequence may pair with another, whose genes fit it
+    claimed = {pair.fasta_id for pair in pairs.values()}
+    searched_pairs, duplicates = pair_by_sequence(unpaired, sequences, claimed)
+    missing = sorted(unpaired.keys() - searched_pairs.keys() - duplicates.keys(),
+                     key=lambda gff_id: -gff_sequences[gff_id].coding_transcripts)
+    n_missing_coding = sum(gff_sequences[gff_id].coding_transcripts for gff_id in missing)
+    if n_missing_coding > max_missing_share * n_coding:
+        raise MismatchedFiles(
+            f'{len(missing)} GFF3 sequences of "{gff_name}" match no sequence of "{fasta_name}" and hold '
+            f'{coding_share(n_missing_coding, n_coding)}, more than the {100 * max_missing_share:g}% allowed '
+            f'to leave out (--max-missing-percent), the most in '
+            f'{", ".join(missing[:5])}. The FASTA file lacks sequences the GFF3 file was made on, or they were '
+            f'renamed and changed after annotation (e.g. trimmed on upload to NCBI). {ADVICE}')
+    return Pairing(pairs | searched_pairs, changed, duplicates)
+
+
+def fasta_out_path(fasta_path: str, gff_out_path: str) -> str:
+    """The FASTA copy's path beside the output GFF3 file: the FASTA file's name with
+    _sequences_dropped before its extension, e.g. genome_sequences_dropped.fna.gz."""
+    return os.path.join(os.path.dirname(gff_out_path),
+                        insert_before_extension(os.path.basename(fasta_path), '_sequences_dropped'))
+
+
+def coding_share(n: int, total: int) -> str:
+    return f'{n} of {total} coding transcripts ({100 * n / total if total else 0:.2f}%)'
+
+
+def log_summary(gff_sequences: dict[str, GffSequence], pairing: Pairing, gff_name: str, fasta_name: str) -> None:
+    pairs, changed, duplicates = pairing.pairs, pairing.changed, pairing.duplicates
+    methods = defaultdict(int)
+    for pair in pairs.values():
+        methods[pair.method] += 1
+    logger.info(f'Paired {len(pairs)} of {len(gff_sequences)} GFF3 sequence IDs of "{gff_name}" with a FASTA '
+                f'sequence of "{fasta_name}": {methods["id"]} by identical ID, {methods["full_name"]} by a word of '
+                f'the FASTA full name (header line), {methods["sequence"]} by sequence alone')
+
+    n_coding = sum(seq.coding_transcripts for seq in gff_sequences.values())
+
+    def log_left_out(gff_ids: list[str], why: str, examples: list[str]) -> int:
+        n_left_out = sum(gff_sequences[gff_id].coding_transcripts for gff_id in gff_ids)
+        if gff_ids:
+            n_lines = sum(gff_sequences[gff_id].n_lines for gff_id in gff_ids)
+            logger.warning(f'Left out {len(gff_ids)} GFF3 sequence IDs {why}: {n_lines} lines, '
+                           f'{coding_share(n_left_out, n_coding)}, {examples}')
+        return n_left_out
+
+    changed_ids = sorted(changed)
+    n_lost = log_left_out(changed_ids, 'found in the FASTA file by ID or full name whose FASTA sequence does not fit '
+                                       'their genes: the FASTA sequence was likely changed after annotation (e.g. '
+                                       'trimmed on upload to NCBI), or the genes need RNA editing, as in organelle '
+                                       'genomes; their FASTA sequences are left out as well, unless paired with '
+                                       'another GFF3 sequence ID',
+                          'e.g. ' + '; '.join(f'{gff_id} ({changed[gff_id][0]}): {changed[gff_id][1]}'
+                                              for gff_id in changed_ids[:5])
+                          + ('; ... (each listed with --pairs-out)' if len(changed_ids) > 5 else ''))
+    gff_id_by_fasta_id = {pair.fasta_id: gff_id for gff_id, pair in pairs.items()}
+    duplicate_ids = sorted(duplicates)
+    n_lost += log_left_out(duplicate_ids, 'whose genes fit a FASTA sequence paired with another GFF3 sequence ID, '
+                                          'likely duplicate sequences removed from the FASTA file',
+                           'e.g. ' + ', '.join(f'{gff_id} (like {gff_id_by_fasta_id[duplicates[gff_id]]})'
+                                               for gff_id in duplicate_ids[:5]))
+    unpaired = sorted(set(gff_sequences) - pairs.keys() - changed.keys() - duplicates.keys())
+    n_lost += log_left_out(unpaired, 'matching no FASTA sequence', 'e.g. ' + ', '.join(unpaired[:5]))
+    logger.info(f'Kept {coding_share(n_coding - n_lost, n_coding)}')
+
+
+def log_stop_codons(gff_sequences: dict[str, GffSequence], pairs: dict[str, Pair], sequences: dict[str, str]) -> None:
+    """Logs the paired transcripts whose stop codon lies right after their CDS instead of in it."""
+    outside, unextendable = 0, []
+    for gff_id, pair in pairs.items():
+        sequence = as_read(sequences[pair.fasta_id], gff_sequences[gff_id].max_end)
+        for stop in gff_sequences[gff_id].stops:
+            if (codon_at(sequence, stop.codon, stop.is_plus) not in MOTIFS['stop']
+                    and codon_at(sequence, stop.after, stop.is_plus) in MOTIFS['stop']):
+                outside += 1
+                if not stop.exon_beyond:
+                    unextendable.append(stop.transcript_id)
+    if outside:
+        logger.info(f'{outside} transcripts have their stop codon right after their CDS instead of as its last '
+                    f'codon, as GFF3 converted from GTF does (GTF writes the stop codon as a line of its own, '
+                    f'outside the CDS); on import, GeenuFF extends the CDS of such a transcript by the 3 bases '
+                    f'following it along its exons')
+    if unextendable:
+        logger.warning(f'{len(unextendable)} of them have no exon or 3\' UTR continuing past their CDS, so GeenuFF '
+                       f'extends the last exon and the transcript by the 3 bases after the CDS, outside what the '
+                       f'GFF3 file annotates, to hold the stop codon; check that this suits the GFF3 file: '
+                       f'{", ".join(unextendable[:5])}{", ..." if len(unextendable) > 5 else ""}')
+
+
+def write_pairs(path: str, gff_sequences: dict[str, GffSequence], pairing: Pairing,
+                full_names: dict[str, str]) -> None:
+    """Writes a TSV row per pair made, and one per GFF3 sequence ID left out, with why. Tabs in FASTA
+    full names are written as spaces."""
+    full_names = {fasta_id: name.replace('\t', ' ') for fasta_id, name in full_names.items()}
+    gff_id_by_fasta_id = {pair.fasta_id: gff_id for gff_id, pair in pairing.pairs.items()}
+    left_out = {gff_id: (fasta_id, f'changed: {why}') for gff_id, (fasta_id, why) in pairing.changed.items()}
+    left_out |= {gff_id: (fasta_id, f'duplicate of {gff_id_by_fasta_id[fasta_id]}')
+                 for gff_id, fasta_id in pairing.duplicates.items()}
+    left_out |= {gff_id: ('', 'matching no FASTA sequence') for gff_id in gff_sequences
+                 if gff_id not in pairing.pairs and gff_id not in left_out}
+    with open(path, 'w') as f:
+        f.write('gff_seqid\tfasta_id\tpaired_by\tchecks_passed\tchecks\tfasta_full_name\tleft_out_because\n')
+        for gff_id, pair in sorted(pairing.pairs.items()):
+            f.write(f'{gff_id}\t{pair.fasta_id}\t{pair.method}\t{pair.passed}\t{pair.checks}\t'
+                    f'{full_names[pair.fasta_id]}\t\n')
+        for gff_id, (fasta_id, why) in sorted(left_out.items()):
+            if gff_id not in pairing.pairs:
+                f.write(f'{gff_id}\t{fasta_id}\t\t\t\t{full_names.get(fasta_id, "")}\t{why}\n')
+
+
+def rename(fasta_path: str, gff_path: str, out_path: str, pairs_out_path: str | None = None,
+           max_missing_share: float = MAX_MISSING_SHARE, gzipped: bool | None = None,
+           compression_level: int = DEFAULT_COMPRESSION_LEVEL,
+           threads: int = DEFAULT_THREADS) -> tuple[dict[str, GffSequence], Pairing, bool]:
+    """Pairs the sequence IDs of a GFF3 file with those of its FASTA file and writes the renamed GFF3
+    file, with a FASTA copy where changed sequences are left out (see the module docstring).
+
+    Args:
+        fasta_path: the FASTA file
+        gff_path: the GFF3 file
+        out_path: the renamed GFF3 file to write
+        pairs_out_path: a TSV file to write the pairs to, if given
+        max_missing_share: see pair_seqids
+        gzipped: whether to gzip the renamed GFF3 file and the FASTA copy, None for each as its input
+        compression_level: their gzip level
+        threads: the threads compressing them (see compression_for)
+
+    Returns:
+        the GFF3 sequences (see read_gff), their pairing, and whether a file was written, none being
+        where all IDs match already
+
+    Raises:
+        MismatchedFiles: see pair_seqids
+    """
+    gff_name, fasta_name = os.path.basename(gff_path), os.path.basename(fasta_path)
+    logger.info(f'Pairing the sequence IDs of the GFF3 file "{gff_name}" with those of the FASTA file '
+                f'"{fasta_name}"')
+    logger.info(f'Reading "{fasta_path}"')
+    sequences, full_names = {}, {}
+    for full_name, sequence in FastaParser.read_fasta(fasta_path):
+        fasta_id = FastaParser.header_id(full_name)
+        sequences[fasta_id], full_names[fasta_id] = sequence.upper(), full_name
+    logger.info(f'Reading "{gff_path}"')
+    gff_sequences = read_gff(gff_path)
+
+    pairing = pair_seqids(gff_sequences, sequences, full_names, gff_name, fasta_name, max_missing_share)
+    log_stop_codons(gff_sequences, pairing.pairs, sequences)
+    pairs = pairing.pairs
+    if len(pairs) == len(gff_sequences) and all(pair.method == 'id' for pair in pairs.values()):
+        logger.info(f'All {len(pairs)} sequence IDs of "{gff_name}" match "{fasta_name}" and their genes fit '
+                    f'their FASTA sequences: nothing to rename, no file written')
+        return gff_sequences, pairing, False
+    log_summary(gff_sequences, pairing, gff_name, fasta_name)
+
+    compression = compression_for(gff_path, gzipped, compression_level, threads)
+    # the unpaired sequence IDs of feature lines and of ##sequence-region lines alone are left out
+    unpaired = (gff_sequences.keys() | sequence_regions(gff_path).keys()) - pairs.keys()
+    write_gff_without(gff_path, output_path(out_path, compression), unpaired, compression,
+                      {gff_id: pair.fasta_id for gff_id, pair in pairs.items()})
+    # a FASTA sequence paired with one GFF3 sequence ID stays, whichever other one it did not fit
+    dropped = {fasta_id for fasta_id, _ in pairing.changed.values()} - {pair.fasta_id for pair in pairs.values()}
+    if dropped:
+        compression = compression_for(fasta_path, gzipped, compression_level, threads)
+        fasta_out = output_path(fasta_out_path(fasta_path, out_path), compression)
+        write_fasta_without(fasta_path, fasta_out, dropped, compression)
+        logger.warning(f'Wrote the FASTA file without the {len(dropped)} changed sequences to "{fasta_out}"; '
+                       f'import it with the renamed GFF3 file')
+    if pairs_out_path:
+        write_pairs(pairs_out_path, gff_sequences, pairing, full_names)
+    return gff_sequences, pairing, True
+
+
+def main(args: argparse.Namespace) -> None:
+    setup_logging(args.log_file)
+    try:
+        rename(args.fasta, args.gff, args.out, args.pairs_out, args.max_missing_percent / 100, args.gzip,
+               args.compression_level, args.threads)
+    except MismatchedFiles as e:
+        logger.error(e)
+        raise SystemExit(1)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_version_arg(parser)
+    parser.add_argument('--fasta', type=str, required=True, help='FASTA file the GFF3 file annotates (may be gzipped)')
+    parser.add_argument('--gff', type=str, required=True, help='GFF3 file to rename (may be gzipped)')
+    parser.add_argument('-o', '--out', type=str,
+                        help=(f'output GFF3 file, gzipped where the GFF3 input is (see --gzip) (default: the GFF3 '
+                              f'file\'s name with {OUT_SUFFIX} before the extension, e.g. genes{OUT_SUFFIX}.gff3); '
+                              f'not written when all sequence IDs match already. Where sequences changed after '
+                              f'annotation are left out, the FASTA file is copied without them beside it, named like '
+                              f'the FASTA file with _sequences_dropped before its extension and gzipped where the '
+                              f'FASTA input is'))
+    parser.add_argument('--pairs-out', type=str,
+                        help=('TSV file listing each pair made, how, how many of its checks passed and the '
+                              'full name of the FASTA sequence, and each GFF3 sequence ID left out, with why'))
+    parser.add_argument('--max-missing-percent', type=float, default=100 * MAX_MISSING_SHARE,
+                        help=('the most coding transcripts, in percent, the GFF3 sequences matching no FASTA '
+                              'sequence may hold to be left out; above it, nothing is written '
+                              f'(default: {100 * MAX_MISSING_SHARE:g})'))
+    add_output_compression_args(parser)
+    parser.add_argument('--log-file', type=str, help='file to write the log to, in addition to the terminal')
+    args = parser.parse_args()
+    require_input_files(parser, [args.gff, args.fasta])
+    require_fasta_and_gff(parser, args.fasta, args.gff)
+    default_out = insert_before_extension(args.gff, OUT_SUFFIX)
+    args.out = output_path(args.out or default_out, output_compression(args, args.gff))
+    check_output_paths(parser, [args.out, args.pairs_out, args.log_file], [args.gff, args.fasta])
+    run_main(main, args)

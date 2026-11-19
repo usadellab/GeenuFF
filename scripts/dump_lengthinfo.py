@@ -1,29 +1,33 @@
 #! /usr/bin/env python3
+import logging
+
 from geenuff.applications.exporters.lengths import LengthExportController
 from geenuff.applications.exporter import MODES, RangeArgParser
+from geenuff.base.helpers import log_version
 
 
 class LengthArgParser(RangeArgParser):
     def __init__(self):
         super().__init__()
-        self.parser.add_argument('--stats-only', action="store_true",
-                                 help="output summary statistics about the lengths instead of the lengths themselves")
+        self.parser.add_argument('--stats-only', action='store_true',
+                                 help='output summary statistics about the lengths instead of the lengths themselves')
 
 
 def main(args):
-    controller = LengthExportController(args.db_path_in, args.longest)
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s: %(message)s')
+    log_version()
+    controller = LengthExportController(args.db_path_in, args.longest, args.coding)
     if args.mode in MODES:
         controller.prep_ranges(MODES[args.mode])
     else:
-        raise NotImplementedError("Requested mode ({}) not in implemented types {}".format(args.mode,
-                                                                                           list(MODES.keys())))
+        raise NotImplementedError(f'Requested mode ({args.mode}) not in implemented types {list(MODES.keys())}')
     if args.stats_only:
         controller.write_length_stats(args.out)
     else:
         controller.write_lengths(args.out)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     parser = LengthArgParser()
     parser.parse_args()
     main(parser.args)
